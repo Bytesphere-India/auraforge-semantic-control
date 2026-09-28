@@ -15,6 +15,10 @@ not needed at runtime. The request/response shape is the same as the Python refe
 implementation (`RLAgent.system_one`) and as TypeSafe Jev's `system_one` API, and the output
 matches the Python implementation to four decimal places.
 
+## AuraForge architectural role
+
+Within AuraForge, this Laya runtime is an interchangeable **Decision Engine**, not an authority plane. The governing architecture is [`docs/governance/AF-ARCH-DECISION-FABRIC-001.md`](docs/governance/AF-ARCH-DECISION-FABRIC-001.md). State projection, Decision Site registration, calibration, abstention, deterministic disposition, evidence, model qualification, and authority boundaries are defined there. This package MUST NOT independently grant FSM transitions, scope, permissions, acceptance, or other AuraForge authority.
+
 ## Install
 
 ```sh
