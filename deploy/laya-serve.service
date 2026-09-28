@@ -1,0 +1,40 @@
+[Unit]
+Description=Laya local shadow decision service (Jev-compatible, 127.0.0.1:8790)
+Documentation=file:%h/projects/auraforge-semantic-control/docs/laya-serve.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/auraforge-semantic-control
+Environment=NODE_ENV=production
+Environment=LAYA_SERVE_HOST=127.0.0.1
+Environment=LAYA_SERVE_PORT=8790
+Environment=LAYA_SERVE_MODEL_DIR=/opt/auraforge/models/laya/base-fp32
+Environment=LAYA_SERVE_HASH_WEIGHTS=1
+Environment=LAYA_SERVE_REQUIRE_SHADOW=0
+# CPU only. The GPU belongs to NInfer; never advertise it to ONNX Runtime.
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=NVIDIA_VISIBLE_DEVICES=none
+Environment=HIP_VISIBLE_DEVICES=
+Environment=ROCR_VISIBLE_DEVICES=
+
+ExecStart=/usr/bin/node %h/projects/auraforge-semantic-control/dist/serve/index.js
+
+Restart=on-failure
+RestartSec=3
+
+# The fp32 ModernBERT-large bundle peaks near 2 GB RSS; bound it below the box.
+MemoryMax=3G
+Nice=10
+
+# Least privilege for a loopback-only, read-only service. The shadow log lives
+# under the user's home and remains writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
