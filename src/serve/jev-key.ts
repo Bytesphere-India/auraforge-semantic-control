@@ -46,12 +46,16 @@ export function secretFingerprint(secret: string): string {
   return createHash("sha256").update(secret).digest("hex").slice(0, 12);
 }
 
-// Bounded name matching avoids false positives on legitimate domain fields
-// (`session_id`, `credential_type`, `password_attempts` are not credentials).
+// A sensitive word matches at the start, after a separator, or after a
+// camelCase boundary (`apiToken`, `userPassword`), but not as a prefix of a
+// longer word (`input_tokens`). The ambiguous words `session`/`credential` match
+// only exactly, so `session_id`/`credential_type` stay usable domain fields.
 const SENSITIVE_KEY = /(authorization|api[_-]?key)/i;
-const SENSITIVE_WORD = /(?:^|[_-])(?:password|passwd|passphrase|secret|credential|session|cookie)(?![a-z0-9_])/i;
-const SENSITIVE_TOKEN = /(?:^|[_-])token(?![a-z0-9_])/i;
-const isSensitiveKey = (key: string): boolean => SENSITIVE_KEY.test(key) || SENSITIVE_WORD.test(key) || SENSITIVE_TOKEN.test(key);
+const SENSITIVE_WORD = /(?:^|[_-])(?:password|passwd|passphrase|secret|cookie|token)(?![a-z0-9])/i;
+const SENSITIVE_CAMEL = /[a-z0-9](?:password|passwd|passphrase|secret|cookie|token)(?![a-z0-9])/i;
+const SENSITIVE_AMBIGUOUS = /^(?:session|credential|credentials)$/i;
+const isSensitiveKey = (key: string): boolean =>
+  SENSITIVE_KEY.test(key) || SENSITIVE_WORD.test(key) || SENSITIVE_CAMEL.test(key) || SENSITIVE_AMBIGUOUS.test(key);
 
 /** Redact a `key[:=]value` assignment when the key names a credential. */
 const redactAssignment = (match: string, quote: string, key: string): string => (isSensitiveKey(key) ? `${quote}${key}${quote}=[REDACTED]` : match);

@@ -342,6 +342,7 @@ test("injects the host key and never forwards or persists a caller credential", 
     const res = await postTap(h, payload, { authorization: `Bearer ${CALLER_KEY}`, "x-caller": "r18b-jev-watch.py" });
     assert.equal(res.status, 200);
     assert.equal(h.upstream.calls[0]?.authorization, `Bearer ${TAP_KEY}`);
+    assert.equal(h.upstream.calls[0]?.headers["x-caller"], undefined, "the internal x-caller header must not reach the upstream");
 
     const [record] = await h.waitForRecords(1);
     assert.ok(record);
@@ -759,7 +760,7 @@ test("keeps legitimate fields, withholds credentials, and marks what was redacte
         token: "t",
         session_id: "s",
         credential_type: "c",
-        password_attempts: 3,
+        login_attempts: 3,
         input_tokens: 11,
         evidence: "ok",
       },
@@ -774,7 +775,7 @@ test("keeps legitimate fields, withholds credentials, and marks what was redacte
     }
     assert.equal(state.session_id, "s", "session_id is a legitimate field, not a credential");
     assert.equal(state.credential_type, "c");
-    assert.equal(state.password_attempts, 3);
+    assert.equal(state.login_attempts, 3);
     assert.equal(state.input_tokens, 11, "token *counts* must not be treated as credentials");
     assert.equal(rec(rec(record.jev).usage).input_tokens, 11);
 
@@ -786,6 +787,49 @@ test("keeps legitimate fields, withholds credentials, and marks what was redacte
 
     assert.ok(!redactSecret(`{"password": "hunter2"}`, null).includes("hunter2"));
     assert.ok(!redactSecret("token=abc12345", null).includes("abc12345"));
+  } finally {
+    await h.close();
+  }
+});
+
+test("withholds camelCase credential names while preserving camelCase domain fields", async () => {
+  const h = await setup();
+  try {
+    const payload = {
+      ...basePayload(),
+      state: {
+        apiToken: "s1",
+        authToken: "s2",
+        sessionToken: "s3",
+        refreshToken: "s4",
+        userPassword: "s5",
+        sessionCookie: "s6",
+        apiSecret: "s7",
+        sessionId: "sid",
+        credentialType: "basic",
+        inputTokens: 11,
+        outputTokens: 3,
+      },
+    };
+    const res = await postTap(h, payload);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    const state = rec(rec(record.request).state);
+    const secretKeys = ["apiToken", "authToken", "sessionToken", "refreshToken", "userPassword", "sessionCookie", "apiSecret"];
+    for (const key of secretKeys) {
+      assert.equal(state[key], "[REDACTED]", `${key} must be withheld (camelCase credential)`);
+    }
+    assert.equal(state.sessionId, "sid", "sessionId is a legitimate field");
+    assert.equal(state.credentialType, "basic");
+    assert.equal(state.inputTokens, 11, "camelCase token counts must not be treated as credentials");
+    assert.equal(state.outputTokens, 3);
+
+    const redactedFields = record.redacted_fields as string[];
+    for (const key of secretKeys) {
+      assert.ok(redactedFields.includes(`request.state.${key}`), `${key} must be listed in redacted_fields`);
+    }
+    assert.ok(!redactedFields.some((path) => path.includes("sessionId")), "legitimate camelCase fields must not be listed");
   } finally {
     await h.close();
   }

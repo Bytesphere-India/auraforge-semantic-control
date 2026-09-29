@@ -6,7 +6,8 @@ the same impact-scoped serve/tap suite and asserts a positive pass count with
 zero failures, so the result is visible to whichever harness collected it.  It
 is impact-scoped: it runs the four `test_serve_*.ts` modules, not the full
 `yarn test` (which also covers model/download tests).  It does not reimplement,
-replace or weaken the TypeScript tests.
+replace or weaken the TypeScript tests.  This file lives inside the project
+worktree (`<repo>/.dsh/tests/`), not in a shared or external location.
 
 Fail-closed on every infrastructure problem: a missing `tsx`, a timeout, a
 non-zero exit, or a summary with no tests / no passes / any failure all fail the

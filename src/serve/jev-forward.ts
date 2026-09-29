@@ -19,8 +19,9 @@ export type HeaderMap = Record<string, string>;
 /**
  * Request headers never forwarded: hop-by-hop headers, the ones the transport
  * sets itself (`host`, `content-length`, `content-type`, `accept`,
- * `authorization`), and `accept-encoding` (the response body is decoded before
- * we re-encode it, so we must not let the upstream compress).
+ * `authorization`), the internal `x-caller` bookkeeping header, and
+ * `accept-encoding` (the response body is decoded before we re-encode it, so we
+ * must not let the upstream compress).
  */
 const REQUEST_SKIP = new Set([
   "host",
@@ -35,6 +36,7 @@ const REQUEST_SKIP = new Set([
   "upgrade",
   "content-length",
   "authorization",
+  "x-caller",
   "accept-encoding",
   "expect",
 ]);

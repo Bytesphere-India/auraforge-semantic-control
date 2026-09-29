@@ -167,7 +167,8 @@ Jev to Laya without changing anything but the URL:
    `Content-Type` and `Accept` (defaulting `Accept` to `application/json` only
    when the caller sent none); the one header it injects is the host-side
    `Authorization`, and a caller-supplied `Authorization` is never forwarded.
-   Callers send no key. The caller id comes from the `X-Caller` request header.
+   Callers send no key. The caller id comes from the `X-Caller` request header,
+   which the tap consumes for the record and does **not** forward upstream.
    Redirects are **not followed** (`redirect: "manual"`), so a 3xx `Location`
    cannot point the tap at loopback or cloud metadata.
 2. **Shadow after the reply.** Dispatch is a handoff: the server commits it only
@@ -205,15 +206,16 @@ Jev to Laya without changing anything but the URL:
    body and when the key is quoted (`{"api_key": "..."}`), consuming a whole
    quoted value so embedded commas/braces/escapes cannot leave a suffix; the
    `X-Caller` value is scrubbed the same way. A key that itself contains the host
-   secret is dropped (recorded without echoing the key). Matching is bounded to
-   credential names — `authorization`, `api_key`, `password`/`passwd`/
-   `passphrase`, `secret`, `credential`, `session`, `cookie`, and `token`/
-   `refresh_token`/`id_token` — so legitimate domain fields such as `session_id`,
-   `credential_type`, `password_attempts` and token _counts_ (`input_tokens`,
-   `output_tokens`, ...) are preserved. Only the media
-   type of a `Content-Type` is persisted (`application/json`, never its
-   parameters). Prototype-polluting keys (`__proto__`, `constructor`,
-   `prototype`) are ignored and storage uses null-prototype objects.
+   secret is dropped (recorded without echoing the key). Matching recognises both
+   `snake_case` and `camelCase` (`apiToken`, `userPassword`, `sessionCookie`) for
+   `authorization`, `api_key`, `password`/`passwd`/`passphrase`, `secret`,
+   `cookie` and `token`, while `session`/`credential` match only exactly — so
+   legitimate domain fields such as `session_id`, `sessionId`, `credential_type`,
+   `credentialType` and token _counts_ (`input_tokens`, `inputTokens`, ...) are
+   preserved. Only the media type of a `Content-Type` is persisted
+   (`application/json`, never its parameters). Prototype-polluting keys
+   (`__proto__`, `constructor`, `prototype`) are ignored and storage uses
+   null-prototype objects.
 
 The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 `503 JEV_TAP_DISABLED`).
