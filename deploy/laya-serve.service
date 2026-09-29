@@ -12,11 +12,14 @@ Environment=LAYA_SERVE_PORT=8790
 Environment=LAYA_SERVE_MODEL_DIR=/opt/auraforge/models/laya/base-fp32
 Environment=LAYA_SERVE_HASH_WEIGHTS=1
 Environment=LAYA_SERVE_REQUIRE_SHADOW=0
-# CPU only. The GPU belongs to NInfer; never advertise it to ONNX Runtime.
-Environment=CUDA_VISIBLE_DEVICES=
-Environment=NVIDIA_VISIBLE_DEVICES=none
-Environment=HIP_VISIBLE_DEVICES=
-Environment=ROCR_VISIBLE_DEVICES=
+# Device policy (Raja 2026-09-29). fp32 is ~1.6 GiB and adds ~2337 MiB of GPU
+# memory, over the hard 2048 MiB ceiling, so it must stay on CPU. To move Laya to
+# the RTX PRO 4000: build a quantized bundle under ~/models/laya/<variant>/,
+# point LAYA_SERVE_MODEL_DIR at it and set LAYA_SERVE_DEVICE=cuda. A CUDA init
+# failure falls back to CPU automatically; the service never blanks the GPU.
+Environment=LAYA_SERVE_DEVICE=cpu
+Environment=LAYA_SERVE_GPU_MEM_MB=2048
+Environment=LAYA_SERVE_GPU_DEVICE_ID=0
 
 ExecStart=/usr/bin/node %h/projects/auraforge-semantic-control/dist/serve/index.js
 

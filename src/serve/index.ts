@@ -1,9 +1,10 @@
 /**
  * `laya-serve` entrypoint.
  *
- * Loads the ONNX bundle once, opens the shadow log, then serves Jev-shaped typed
- * questions on 127.0.0.1 only. CPU execution provider only; no outbound network,
- * no credentials, no GPU.
+ * Loads the ONNX bundle once, opens the shadow log, warms the session, then
+ * serves Jev-shaped typed questions on 127.0.0.1 only. The execution provider is
+ * chosen by `LAYA_SERVE_DEVICE` (cuda by default, cpu fallback); the CUDA EP is
+ * capped at 2048 MiB VRAM and a GPU init failure is logged and falls back to CPU.
  *
  *   LAYA_SERVE_MODEL_DIR=/opt/auraforge/models/laya/base-fp32 \
  *   LAYA_SERVE_SHADOW_LOG=~/.auraforge-work/shadow/laya-decisions.jsonl \
@@ -13,8 +14,8 @@ import { createHash } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { Laya } from "../laya.js";
 import { loadServeConfig, deriveModelId } from "./config.js";
+import { loadEngine, warmupEngine } from "./device.js";
 import { fetchJevTransport } from "./jev-forward.js";
 import { JEV_KEY_ENV, loadJevKey } from "./jev-key.js";
 import { createJevTap } from "./jev-tap.js";
@@ -72,12 +73,19 @@ async function main(): Promise<void> {
     modelSha256,
     modelDataSha256,
     calibrationStatus: "UNQUALIFIED",
-    executionProviders: [...config.executionProviders],
+    // Replaced below with the providers the session actually opened with.
+    executionProviders: [config.device.requested],
   };
 
-  // Load the model exactly once, pinned to the CPU execution provider.
+  // Load the model exactly once, honoring the CUDA/CPU policy. `loadEngine`
+  // falls back to CPU (and logs) when CUDA cannot initialize, so the service
+  // never crashes because of a missing/broken GPU.
   const startedAtMs = Date.now();
-  const laya = await Laya.load({ modelDir: config.modelDir, executionProviders: ["cpu"] });
+  const outcome = await loadEngine({ modelDir: config.modelDir, cfg: config.device });
+  const laya = outcome.laya;
+  identity.executionProviders = [...outcome.providers];
+  const device = outcome.device;
+  const warmed = await warmupEngine(laya);
   const engine: DecisionEngine = {
     systemOne: (state, questions) => laya.systemOne(state, questions),
   };
@@ -155,7 +163,8 @@ async function main(): Promise<void> {
         `engine=${identity.engine}@${identity.engineVersion} model=${identity.model} ` +
         `model_sha256=${identity.modelSha256} weights_sha256=${identity.modelDataSha256 ?? "unhashed"} ` +
         `dir=${identity.modelDir} calibration=${identity.calibrationStatus} ` +
-        `providers=${identity.executionProviders.join(",")} ` +
+        `device=${device} providers=${identity.executionProviders.join(",")} ` +
+        `gpu_mem_limit_mb=${config.device.gpuMemMb} warmed=${warmed ? "yes" : "no"} ` +
         `shadow=${shadowStats.path ?? "disabled"}${shadowStats.writable ? "" : " (NOT WRITABLE)"} ` +
         `jev_upstream=${tap?.upstream ?? "disabled"} jev_key=${tap?.key_present ? "present" : "absent"} ` +
         `jev_pairs=${pairsStats.path ?? "disabled"}${pairsStats.writable ? "" : " (NOT WRITABLE)"} ` +

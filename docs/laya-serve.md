@@ -12,8 +12,15 @@ only **serves and logs**; it never learns online.
 
 - **Loopback only.** The bind host is validated at startup; a non-loopback
   address fails closed. There is no auth and no TLS because nothing is exposed.
-- **CPU only.** The session is pinned to `executionProviders: ["cpu"]`. The GPU
-  belongs to NInfer and is never advertised to ONNX Runtime.
+- **GPU allowed under a hard ceiling (Raja 2026-09-29).** Laya may share the
+  RTX PRO 4000 with NInfer Bonsai2 and Qwen4b llama-server, but only under a
+  **hard 2048 MiB total VRAM ceiling** (context included) and never at NInfer's
+  expense. The execution provider is chosen by `LAYA_SERVE_DEVICE` (`cuda` by
+  default, `cpu` to opt out). The CPU fallback is mandatory: a missing GPU, an
+  insufficient driver, or a CUDA init failure is logged and the session opens on
+  CPU instead of crashing. fp32 (~1.6 GiB of weights) cannot meet the ceiling —
+  fp32 stays on CPU; only a quantized (nvfp4/fp8/fp16) variant may run on CUDA,
+  and only after its measured total GPU delta is ≤ 2048 MiB.
 - **No unrequested egress.** The decision route loads the model from a local
   directory (`Laya.load({ modelDir })`), never the network. The only outbound
   call in the process is the tap forwarding a caller's request to the
@@ -31,6 +38,34 @@ only **serves and logs**; it never learns online.
   hashes: `a874eb25…dba1e` (graph) and `4877463…42aba` (weights).
 - **`calibration_status` is always `"UNQUALIFIED"`.** The bundle passed
   AF-LAYA-REPEATABILITY-001, which is repeatability, not decision calibration.
+
+## Device policy (GPU, Raja 2026-09-29)
+
+Laya may run on the RTX PRO 4000 shared with NInfer Bonsai2 and Qwen4b
+llama-server, subject to two non-negotiables:
+
+1. **Hard 2048 MiB total VRAM ceiling**, context included. onnxruntime-node
+   1.22's CUDA bridge only forwards `deviceId`; `gpu_mem_limit` and
+   `arena_extend_strategy: kSameAsRequested` are recorded in the provider config
+   (`src/serve/device.ts`) but are **not honoured by the binding**, so the
+   ceiling is met by model size and verified by measuring the total GPU delta,
+   not by trusting the option. fp32 on CUDA adds ≈ 2337 MiB before any inference
+   and therefore must stay on CPU; only a small quantized variant
+   (nvfp4 / fp8 / fp16, ≈ 0.8 GiB) may be promoted to CUDA, and only after its
+   measured total delta is ≤ 2048 MiB.
+2. **Never crowd out NInfer.** The provider list is `["cuda", "cpu"]`, so
+   unsupported nodes fall back per-node rather than failing the session. Startup
+   warms the session with one dummy inference so steady-state latency is not
+   paid by the first caller.
+
+`LAYA_SERVE_DEVICE=cuda` (default) attempts CUDA and falls back to CPU, logging
+the first line of the GPU error, when the driver, device, or provider library is
+unavailable. `LAYA_SERVE_DEVICE=cpu` skips CUDA entirely. For a quantized
+FP8/NVFP4 bundle, which the CUDA EP cannot execute, set
+`LAYA_SERVE_PROVIDERS=tensorrt,cuda,cpu` (the TensorRT EP needs the matching
+`libnvinfer.so.*` on `LD_LIBRARY_PATH`); `cpu` stays last so a failed TensorRT/CUDA
+init still lands on CPU. `[N/A]` per-process VRAM accounting under WSL2 is
+expected; use the device-total delta from `scripts/bench-latency.ts`.
 
 ## Endpoints
 
@@ -115,6 +150,11 @@ Errors are `{ "error": "…", "code": "…" }` with `400` (validation),
   "shadow_log": { "enabled": true, "path": "…/laya-decisions.jsonl", "writable": true, "lines": 10, "errors": 0, "last_error": null }
 }
 ```
+
+`execution_providers` is reported truthfully: `["cuda", "cpu"]` when the CUDA
+session opened (CPU is ONNX Runtime's per-node fallback), or `["cpu"]` when the
+CUDA attempt failed and the process fell back at startup. There is no way to
+claim CUDA when the session is on CPU.
 
 ## Shadow log
 
@@ -228,6 +268,12 @@ The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 | `LAYA_SERVE_PORT`               | `8790`                                          | listen port                             |
 | `LAYA_SERVE_MODEL_DIR`          | `/opt/auraforge/models/laya/base-fp32`          | ONNX bundle                             |
 | `LAYA_SERVE_MODEL_ID`           | derived (`laya-base-fp32`)                      | identity string                         |
+| `LAYA_SERVE_DEVICE`             | `cuda`                                          | `cuda` (CPU fallback) or `cpu`          |
+| `LAYA_SERVE_PROVIDERS`          | unset                                           | explicit EP list, e.g. `tensorrt,cuda,cpu` |
+| `LAYA_SERVE_GPU_MEM_MB`         | `2048`                                          | hard VRAM ceiling for the CUDA EP (MiB) |
+| `LAYA_SERVE_GPU_DEVICE_ID`      | `0`                                             | CUDA device ordinal                     |
+| `LAYA_SERVE_INTRA_OP_THREADS`   | unset (ORT default)                             | CPU intra-op threads                    |
+| `LAYA_SERVE_INTER_OP_THREADS`   | unset (ORT default)                             | CPU inter-op threads                    |
 | `LAYA_SERVE_SHADOW_LOG`         | `~/.auraforge-work/shadow/laya-decisions.jsonl` | JSONL path; empty disables              |
 | `LAYA_SERVE_HASH_WEIGHTS`       | `1`                                             | hash `laya.onnx.data` at startup        |
 | `LAYA_SERVE_REQUIRE_SHADOW`     | `0`                                             | fail startup when the log is unwritable |
@@ -272,7 +318,40 @@ sample numbers below; `dist/` is built by `yarn build` or the install script):
 ```
 
 Model load is once at startup (session load ≈ 2.2 s warm; plus ≈ 3.4 s to hash
-the 1.6 GB weights when `LAYA_SERVE_HASH_WEIGHTS=1`).
+the 1.6 GB weights when `LAYA_SERVE_HASH_WEIGHTS=1`), followed by one warm-up
+inference so the first caller does not pay the first-run cost. Set
+`LAYA_SERVE_DEVICE=cuda` (default) with `LAYA_SERVE_MODEL_DIR` pointing at a
+quantized bundle that fits the 2048 MiB ceiling; leave it unset for fp32, which
+must stay on CPU. The startup line reports `device=… providers=… warmed=…`.
+
+### Latency bench
+
+```sh
+yarn bench:latency                                  # cuda then cpu, 5 runs each
+LAYA_SERVE_MODEL_DIR=~/models/laya/base-fp16 LAYA_BENCH_DEVICES=cuda yarn bench:latency
+```
+
+The bench runs the docs' three-question batch against a small (~64 B) and a 3 KB
+state, reports p50/p95/min/max per device, samples `nvidia-smi` before/after for
+the total VRAM delta, and reports a device as `SKIP` with the CUDA reason when no
+GPU is reachable. It never fails the run for a missing GPU.
+
+### Quantization (NVFP4 → FP8 → fp16)
+
+`scripts/quantize-laya.py` writes quantized bundles under `~/models/laya/<variant>/`
+without ever touching `/opt/auraforge/models/laya/base-fp32`. It creates the
+dedicated venv `~/.venv-laya-quant` (`nvidia-modelopt[onnx]`, `tensorrt`, `onnx`)
+and calibrates on the repo test fixtures only:
+
+```sh
+python3 scripts/quantize-laya.py --variant nvfp4   # falls back fp8, then fp16
+```
+
+onnxruntime's CUDA EP cannot execute FP8/NVFP4: those need the **TensorRT EP**,
+which requires `libnvinfer.so.*` on `LD_LIBRARY_PATH` (from the TensorRT pip
+wheel). When the TensorRT EP cannot load a variant, the script records that and
+falls back to fp16 on the CUDA EP. fp32 remains the default until answer parity
+against it is measured with `yarn bench:latency` plus the parity check below.
 
 ## Install (systemd user unit)
 
@@ -290,20 +369,31 @@ curl -s http://127.0.0.1:8790/health
 
 To keep it running without an active login: `loginctl enable-linger "$USER"`.
 The unit sets `Restart=on-failure`, `RestartSec=3`, `MemoryMax=3G`, `Nice=10`,
-the model-dir environment, and blank GPU-visibility variables.
+the model-dir environment, and the 2048 MiB VRAM ceiling. It no longer blanks
+`CUDA_VISIBLE_DEVICES` (the old CPU-only guard) and instead leaves the device
+policy to `LAYA_SERVE_DEVICE`; point `LAYA_SERVE_MODEL_DIR` at a quantized
+bundle before enabling CUDA.
 
 ## Tests
 
-Offline (no model, no network):
-
 ```sh
-./node_modules/.bin/tsx --test test/test_serve_protocol.ts test/test_serve_shadow.ts test/test_serve_http.ts
+./node_modules/.bin/tsx --test test/test_serve_protocol.ts test/test_serve_device.ts test/test_serve_shadow.ts test/test_serve_http.ts
 # or: yarn test:serve
 ```
 
 Covers request validation and limits, response shape/identity,
 `canonicalJson`/request hashing, the shadow-line format and its no-raw-text
-property, HTTP status codes and the engine-failure path.
+property, HTTP status codes, the engine-failure path, and the device policy
+(env parsing, provider construction, CUDA→CPU fallback). The CUDA probe test
+skips cleanly when no GPU/CUDA driver is reachable.
+
+### Answer parity
+
+`scripts/quantize-laya.py` also runs each produced variant and the fp32 baseline
+on the repo test fixtures and reports the maximum absolute difference of `noul`
+(and of each score level/choice probability). A variant is only eligible for
+`LAYA_SERVE_DEVICE=cuda` once the parity number is recorded; fp32 stays the
+default until then.
 
 ## Sample run (2026-09-28, base-fp32)
 

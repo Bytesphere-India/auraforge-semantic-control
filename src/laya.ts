@@ -28,6 +28,11 @@ export interface LayaOptions extends DownloadOptions {
 
 const round4 = (x: number) => Math.round(x * 1e4) / 1e4;
 
+/** The names of the execution providers a config list expands to. */
+function providerNames(providers: ort.InferenceSession.ExecutionProviderConfig[]): string[] {
+  return providers.map((provider) => (typeof provider === "string" ? provider : provider.name));
+}
+
 export class Laya {
   private constructor(
     private readonly session: ort.InferenceSession,
@@ -36,6 +41,8 @@ export class Laya {
     private readonly ids: SpecialIds,
     /** where the bundle was loaded from */
     readonly modelDir: string,
+    /** execution providers the session was created with, in priority order */
+    readonly providers: string[],
   ) {}
 
   static async load(opts: LayaOptions = {}): Promise<Laya> {
@@ -49,12 +56,13 @@ export class Laya {
       return v;
     };
     const ids: SpecialIds = { cls: id("[CLS]"), sep: id("[SEP]"), mask: id("[MASK]"), pad: id("[PAD]"), maskTok: "[MASK]" };
+    const executionProviders = opts.executionProviders ?? ["cpu"];
     const session = await ort.InferenceSession.create(path.join(modelDir, "laya.onnx"), {
-      executionProviders: opts.executionProviders ?? ["cpu"],
+      executionProviders,
       graphOptimizationLevel: "all",
       ...opts.sessionOptions,
     });
-    return new Laya(session, tok, config, ids, modelDir);
+    return new Laya(session, tok, config, ids, modelDir, providerNames(executionProviders));
   }
 
   private readonly encode = (text: string): number[] => this.tok.encode(text, { add_special_tokens: false }).ids;

@@ -25,7 +25,7 @@ export interface EngineIdentity {
   modelDataSha256: string | null;
   /** the model has NOT been calibrated for decision acceptance; never claim otherwise */
   calibrationStatus: "UNQUALIFIED";
-  /** requested execution providers; CPU only by policy */
+  /** execution providers the session actually opened with (cuda, or cpu on fallback) */
   executionProviders: string[];
 }
 

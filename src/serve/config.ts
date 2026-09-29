@@ -6,6 +6,7 @@
  */
 import os from "node:os";
 import path from "node:path";
+import { loadDeviceConfig, type DeviceConfig } from "./device.js";
 import { parseJevUpstream } from "./jev-forward.js";
 import { DEFAULT_LIMITS, type ServeLimits } from "./protocol.js";
 
@@ -48,8 +49,11 @@ export interface ServeConfig {
   requireShadow: boolean;
   maxBodyBytes: number;
   limits: ServeLimits;
-  /** CPU only by policy; the GPU belongs to NInfer */
-  executionProviders: string[];
+  /**
+   * Execution-provider policy: CUDA (RTX PRO 4000) by default with a hard
+   * 2048 MiB VRAM ceiling and CPU fallback, per Raja's 2026-09-29 amendment.
+   */
+  device: DeviceConfig;
   jev: JevTapConfig;
 }
 
@@ -201,7 +205,7 @@ export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConf
       ...DEFAULT_LIMITS,
       maxQuestions: positiveInt(env, "LAYA_SERVE_MAX_QUESTIONS", DEFAULT_LIMITS.maxQuestions, 4096),
     },
-    executionProviders: ["cpu"],
+    device: loadDeviceConfig(env),
     jev: {
       enabled: boolean(env, "LAYA_SERVE_JEV_ENABLED", true),
       upstreamUrl,
