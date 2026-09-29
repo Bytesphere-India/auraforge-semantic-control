@@ -15,8 +15,11 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { Laya } from "../laya.js";
 import { loadServeConfig, deriveModelId } from "./config.js";
+import { fetchJevTransport } from "./jev-forward.js";
+import { loadJevKey } from "./jev-key.js";
+import { createJevTap } from "./jev-tap.js";
 import { createServer } from "./server.js";
-import { ShadowLog } from "./shadow.js";
+import { JevLayaPairsLog, ShadowLog } from "./shadow.js";
 import type { EngineIdentity, DecisionEngine } from "./types.js";
 
 const require = createRequire(import.meta.url);
@@ -75,10 +78,33 @@ async function main(): Promise<void> {
     throw new Error(`LAYA_SERVE_REQUIRE_SHADOW=1 but the shadow log is not writable: ${shadowStats.path}`);
   }
 
+  // The Jev shadow tap: host-side key, joined pairs log, transparent forwarder.
+  const pairs = new JevLayaPairsLog(config.jev.pairsLogPath, () => new Date());
+  const pairsStats = config.jev.enabled ? pairs.open() : pairs.stats();
+  if (config.requireShadow && config.jev.enabled && !pairsStats.writable) {
+    throw new Error(`LAYA_SERVE_REQUIRE_SHADOW=1 but the Jev-Laya pairs log is not writable: ${pairsStats.path}`);
+  }
+  const jevKey = config.jev.enabled ? loadJevKey(process.env, config.jev.secretsPath) : null;
+  const jevTap = config.jev.enabled
+    ? createJevTap({
+        upstreamUrl: config.jev.upstreamUrl,
+        apiKey: jevKey,
+        transport: fetchJevTransport,
+        timeoutMs: config.jev.timeoutMs,
+        engine,
+        identity,
+        shadow,
+        pairs,
+        limits: config.limits,
+        queueMax: config.jev.queueMax,
+      })
+    : null;
+
   const server = createServer({
     engine,
     identity,
     shadow,
+    jevTap: jevTap ?? undefined,
     config: {
       host: config.host,
       port: config.port,
@@ -94,6 +120,10 @@ async function main(): Promise<void> {
     shuttingDown = true;
     process.stderr.write(`laya-serve: ${signal}; shutting down\n`);
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (jevTap) {
+      // Flush queued Laya shadows, but never hang shutdown on a stuck run.
+      await Promise.race([jevTap.drain(), new Promise<void>((resolve) => setTimeout(resolve, 20_000))]);
+    }
     try {
       await laya.close();
     } catch {
@@ -110,6 +140,7 @@ async function main(): Promise<void> {
   });
 
   server.listen(config.port, config.host, () => {
+    const tap = jevTap?.stats() ?? null;
     process.stderr.write(
       `laya-serve: listening on http://${config.host}:${config.port} ` +
         `engine=${identity.engine}@${identity.engineVersion} model=${identity.model} ` +
@@ -117,6 +148,8 @@ async function main(): Promise<void> {
         `dir=${identity.modelDir} calibration=${identity.calibrationStatus} ` +
         `providers=${identity.executionProviders.join(",")} ` +
         `shadow=${shadowStats.path ?? "disabled"}${shadowStats.writable ? "" : " (NOT WRITABLE)"} ` +
+        `jev_upstream=${tap?.upstream ?? "disabled"} jev_key=${tap?.key_present ? "present" : "absent"} ` +
+        `jev_pairs=${pairsStats.path ?? "disabled"}${pairsStats.writable ? "" : " (NOT WRITABLE)"} ` +
         `load_ms=${Date.now() - startedAtMs}\n`,
     );
   });

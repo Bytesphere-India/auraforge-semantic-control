@@ -13,8 +13,9 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Answer } from "../types.js";
+import type { JevTap, TapResponse } from "./jev-tap.js";
 import { buildDecisionResponse, computeRequestHash, validateDecisionRequest, type ServeLimits } from "./protocol.js";
-import type { ShadowLog } from "./shadow.js";
+import { recordShadowAnswers, type ShadowLog } from "./shadow.js";
 import type { DecisionEngine, EngineIdentity, ErrorResponseBody } from "./types.js";
 
 export interface ServeConfig {
@@ -33,9 +34,19 @@ export interface ServerDeps {
   config: ServeConfig;
   /** monotonic milliseconds; injectable for deterministic latency in tests */
   now?: () => number;
+  /** Jev shadow tap; when absent the tap route reports 503 */
+  jevTap?: JevTap;
 }
 
 const DECISION_PATHS = new Set(["/api/alpha/decisions", "/decisions", "/v1/decisions"]);
+const JEV_TAP_PATHS = new Set(["/jev/api/alpha/decisions", "/jev/decisions"]);
+
+function headerValue(value: string | string[] | undefined): string | null {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -78,7 +89,7 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<BodyRes
 }
 
 export function createServer(deps: ServerDeps): http.Server {
-  const { engine, identity, shadow, config } = deps;
+  const { engine, identity, shadow, config, jevTap } = deps;
   const now = deps.now ?? (() => performance.now());
   let requests = 0;
   let errors = 0;
@@ -99,6 +110,7 @@ export function createServer(deps: ServerDeps): http.Server {
     requests,
     errors,
     shadow_log: shadow.stats(),
+    jev_tap: jevTap ? jevTap.stats() : null,
   });
 
   const handleDecision = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -124,7 +136,6 @@ export function createServer(deps: ServerDeps): http.Server {
 
     const requestId = randomUUID();
     const requestHash = computeRequestHash(identity, validated.state, validated.questions);
-    const questionIds = Object.keys(validated.questions);
     const started = now();
     requests += 1;
 
@@ -139,19 +150,15 @@ export function createServer(deps: ServerDeps): http.Server {
       // carry raw input text.
       const latencyMs = Math.max(0, now() - started);
       errors += 1;
-      for (const questionId of questionIds) {
-        shadow.record(identity, {
-          requestId,
-          requestHash,
-          questionId,
-          questionType: validated.questions[questionId]?.type ?? "noul",
-          answer: null,
-          latencyMs,
-          inputTokens: 0,
-          status: "error",
-          error: "ENGINE_ERROR",
-        });
-      }
+      recordShadowAnswers(shadow, identity, {
+        requestId,
+        requestHash,
+        questions: validated.questions,
+        answers: null,
+        latencyMs,
+        inputTokens: 0,
+        error: "ENGINE_ERROR",
+      });
       return sendError(res, 422, "ENGINE_ERROR", "the model could not answer this request; see service logs");
     }
 
@@ -165,28 +172,52 @@ export function createServer(deps: ServerDeps): http.Server {
       usage: { input_tokens: inputTokens, output_tokens: 0 },
     });
 
-    for (const questionId of questionIds) {
-      const answer = answers[questionId];
-      shadow.record(identity, {
-        requestId,
-        requestHash,
-        questionId,
-        questionType: answer?.type ?? validated.questions[questionId]?.type ?? "noul",
-        answer: answer ?? null,
-        latencyMs,
-        inputTokens,
-        status: answer ? "ok" : "error",
-        error: answer ? null : "MISSING_ANSWER",
-      });
-    }
+    recordShadowAnswers(shadow, identity, {
+      requestId,
+      requestHash,
+      questions: validated.questions,
+      answers,
+      latencyMs,
+      inputTokens,
+      error: "MISSING_ANSWER",
+    });
 
     sendJson(res, 200, response);
+  };
+
+  const handleJevTap = async (req: IncomingMessage, res: ServerResponse, tap: JevTap): Promise<void> => {
+    const body = await readBody(req, config.maxBodyBytes);
+    if (!body.ok) {
+      errors += 1;
+      return sendError(res, body.status, body.code, body.message);
+    }
+    const caller = headerValue(req.headers["x-caller"]);
+    const contentType = headerValue(req.headers["content-type"]) ?? "application/json";
+    requests += 1;
+
+    let forwarded: TapResponse;
+    try {
+      forwarded = await tap.handle(body.text, caller, contentType);
+    } catch {
+      errors += 1;
+      return sendError(res, 502, "JEV_TAP_ERROR", "the Jev shadow tap failed to forward the request");
+    }
+    res.writeHead(forwarded.status, { "content-type": forwarded.contentType, "content-length": Buffer.byteLength(forwarded.body) });
+    res.end(forwarded.body);
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const pathname = normalizePath(req.url ?? "/");
     if ((req.method === "GET" || req.method === "HEAD") && (pathname === "/health" || pathname === "/healthz")) {
       return sendJson(res, 200, health());
+    }
+    if (JEV_TAP_PATHS.has(pathname)) {
+      if (req.method !== "POST") {
+        res.setHeader("allow", "POST");
+        return sendError(res, 405, "METHOD_NOT_ALLOWED", "use POST for the Jev shadow tap");
+      }
+      if (!jevTap) return sendError(res, 503, "JEV_TAP_DISABLED", "the Jev shadow tap is not configured");
+      return handleJevTap(req, res, jevTap);
     }
     if (DECISION_PATHS.has(pathname)) {
       if (req.method !== "POST") {

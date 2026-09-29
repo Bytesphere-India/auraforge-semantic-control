@@ -10,8 +10,26 @@ import { DEFAULT_LIMITS, type ServeLimits } from "./protocol.js";
 
 export const DEFAULT_MODEL_DIR = "/opt/auraforge/models/laya/base-fp32";
 export const DEFAULT_SHADOW_LOG = path.join(os.homedir(), ".auraforge-work", "shadow", "laya-decisions.jsonl");
+export const DEFAULT_JEV_UPSTREAM = "https://openrouter.ai/api/alpha/decisions";
+export const DEFAULT_JEV_PAIRS_LOG = path.join(os.homedir(), ".auraforge-work", "shadow", "jev-laya-pairs.jsonl");
+export const DEFAULT_JEV_SECRETS = path.join(os.homedir(), ".config", "auraforge", "secrets.env");
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 8790;
+
+/** The Jev shadow tap's host-side configuration. */
+export interface JevTapConfig {
+  enabled: boolean;
+  /** upstream OpenRouter decisions endpoint (overridable for tests/self-host) */
+  upstreamUrl: string;
+  /** joined `jev-laya-pairs.jsonl` path; null disables the joined record */
+  pairsLogPath: string | null;
+  /** `secrets.env`-style file searched for OPENROUTER_JEV_API_KEY */
+  secretsPath: string;
+  /** upstream timeout; the caller's Jev response is bounded by this */
+  timeoutMs: number;
+  /** queued Laya shadows before overflow (overflow still writes a pair) */
+  queueMax: number;
+}
 
 export interface ServeConfig {
   host: string;
@@ -29,6 +47,7 @@ export interface ServeConfig {
   limits: ServeLimits;
   /** CPU only by policy; the GPU belongs to NInfer */
   executionProviders: string[];
+  jev: JevTapConfig;
 }
 
 function expandHome(value: string): string {
@@ -71,6 +90,11 @@ export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConf
 
   const modelDir = path.resolve(expandHome(env.LAYA_SERVE_MODEL_DIR || DEFAULT_MODEL_DIR));
   const shadowRaw = env.LAYA_SERVE_SHADOW_LOG === undefined ? DEFAULT_SHADOW_LOG : env.LAYA_SERVE_SHADOW_LOG;
+  const pairsRaw = env.LAYA_SERVE_JEV_PAIRS_LOG === undefined ? DEFAULT_JEV_PAIRS_LOG : env.LAYA_SERVE_JEV_PAIRS_LOG;
+  const upstreamUrl = env.LAYA_SERVE_JEV_UPSTREAM || DEFAULT_JEV_UPSTREAM;
+  if (!/^https?:\/\//.test(upstreamUrl)) {
+    throw new Error(`LAYA_SERVE_JEV_UPSTREAM must be an http(s) URL, got ${JSON.stringify(upstreamUrl)}`);
+  }
 
   return {
     host,
@@ -86,5 +110,13 @@ export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConf
       maxQuestions: positiveInt(env, "LAYA_SERVE_MAX_QUESTIONS", DEFAULT_LIMITS.maxQuestions, 4096),
     },
     executionProviders: ["cpu"],
+    jev: {
+      enabled: boolean(env, "LAYA_SERVE_JEV_ENABLED", true),
+      upstreamUrl,
+      pairsLogPath: pairsRaw === "" ? null : path.resolve(expandHome(pairsRaw)),
+      secretsPath: path.resolve(expandHome(env.LAYA_SERVE_JEV_SECRETS || DEFAULT_JEV_SECRETS)),
+      timeoutMs: positiveInt(env, "LAYA_SERVE_JEV_TIMEOUT_MS", 60_000, 300_000),
+      queueMax: positiveInt(env, "LAYA_SERVE_JEV_QUEUE_MAX", 256, 1_000_000),
+    },
   };
 }
