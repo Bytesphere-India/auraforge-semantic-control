@@ -21,13 +21,13 @@
  *       "cache_prompt": true
  *     }
  *
- * `choice` / `score` use the older draft mapping, one batched call for all
- * non-`noul` questions. The draft's JSON-Schema wrapper
- * (`{"type":"object","properties":{...}}`) is **not** the native format: the
- * verified Parallel Decision `schema` is a *field map* (`{"<field>": <descriptor>}`,
- * as the native `{"result": {...}}` proves), and `results[0].fields.<field>`
- * mirrors it. We therefore send a field map keyed by question id; the mapping and
- * its limits are documented in `docs/laya-serve.md`.
+ * `choice` / `score` use the brief's older draft mapping, one batched call for
+ * all non-`noul` questions, with the exact draft schema
+ * (`{"type":"object","properties":{<qid>: <per type>},"required":[all qids]}`)
+ * and the state plus every question id/type/instructions/criteria in `contexts`.
+ * The reply is read from `results[0].fields.<qid> = {value, probability}` (the
+ * per-question field map), with the one-level wrapper shape also recognised for
+ * robustness; the mapping and its limits are documented in `docs/laya-serve.md`.
  *
  * Probability normalization: the endpoint reports the probability of the
  * *selected* value, never blindly P(TRUE). `true + p` -> `p_true = p`;
@@ -148,11 +148,13 @@ export function renderQuestionText(instructions: string | object): string {
 /**
  * A caller-supplied field must never be able to inject the fixed `TRUE:`/`FALSE:`
  * section headers of the rendered Boolean question (or the classifier
- * terminator); fail closed rather than ask a spoofed question. The gate matches
- * `\n`, `\r\n` and a bare `\r` at any line start (`m`), and the classifier
- * sentence case-insensitively with optional terminal punctuation.
+ * terminator); fail closed rather than ask a spoofed question. The header gate
+ * anchors to any line start (`m` covers `\n`, `\r`, `\u2028` and `\u2029`) and
+ * tolerates any Unicode horizontal whitespace (NBSP included) before/after the
+ * keyword; the classifier sentence is matched case-insensitively with optional
+ * terminal punctuation.
  */
-const STRUCTURAL_HEADER = /(?:\r?\n|\r|^)[ \t]*(?:TRUE|FALSE)[ \t]*:/im;
+const STRUCTURAL_HEADER = /^[^\S\n\r\u2028\u2029]*(?:TRUE|FALSE)[^\S\n\r\u2028\u2029]*:/imu;
 const CLASSIFIER_TERMINATOR = /classify\s+only\s+from\s+the\s+supplied\s+evidence\.?/i;
 
 function assertNoInjection(label: string, text: string): void {
@@ -263,15 +265,20 @@ export function renderBatchContext(state: unknown, questions: Array<[string, Que
 
 /**
  * Build the batched call for every `choice`/`score` question, or `null` when the
- * request has none. `schema` is the native field map keyed by question id.
+ * request has none. `schema` is the brief's exact draft wrapper
+ * (`{"type":"object","properties":{<qid>: <per type>},"required":[all qids]}`).
  */
 export function buildBatchRequest(state: unknown, questions: Array<[string, Question]>): Record<string, unknown> | null {
   if (questions.length === 0) return null;
-  const schema: Record<string, unknown> = {};
-  for (const [qid, question] of questions) schema[qid] = batchDescriptor(question);
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+  for (const [qid, question] of questions) {
+    properties[qid] = batchDescriptor(question);
+    required.push(qid);
+  }
   return {
     instructions: QWEN4B_BATCH_INSTRUCTIONS,
-    schema,
+    schema: { type: "object", properties, required },
     contexts: [renderBatchContext(state, questions)],
     mode: QWEN4B_MODE,
     cache_prompt: QWEN4B_CACHE_PROMPT,

@@ -312,8 +312,10 @@ Decision call, rendered deterministically (no LLM transforms the question pack):
 
 A question or criterion that embeds a `TRUE:`/`FALSE:` section header or the
 classifier terminator is rejected (`QWEN4B_STRUCTURAL_HEADER`) rather than asked
-with a spoofed structure. The header gate covers `\n`, `\r\n` and a bare `\r` at
-any line start, and the classifier terminator is matched case-insensitively with
+with a spoofed structure. The header gate anchors to any line start (`\n`,
+`\r\n`, a bare `\r`, and the Unicode line/paragraph separators `U+2028`/`U+2029`)
+and tolerates any Unicode horizontal whitespace (a no-break space included)
+before the keyword; the classifier terminator is matched case-insensitively with
 optional terminal punctuation. A `noul` question without criteria renders the
 question and the classifier line only.
 
@@ -326,19 +328,18 @@ result, a disagreement between `results[0].decision.result` and
 and **never** an answer.
 
 **`choice` / `score` (older draft mapping).** All non-`noul` questions go in one
-batched call. The draft's `{"type":"object","properties":{...}}` wrapper is not
-the native format — the verified Parallel Decision `schema` is a *field map*
-keyed by output name (as the native `{"result": {...}}` proves) and
-`results[0].fields.<name>` mirrors it — so the batch sends a field map keyed by
-question id: `choice` -> `{"type":"string","enum":[<criteria keys>]}`; `score` ->
+batched call with the brief's exact draft schema
+(`{"type":"object","properties":{<qid>: <per type>},"required":[all qids]}`):
+`choice` -> `{"type":"string","enum":[<criteria keys>]}`; `score` ->
 `{"type":"object","properties":{<level>:{"type":"boolean"}}}`. The batched
 context is the canonical `state` followed by each question's id, type,
-instructions and criteria. The reply is read from the field map directly, with
-the draft wrapper recognised only by shape (a lone `result` object), so a
-question literally named `result` cannot be mistaken for the wrapper. `choice`
-records the selected option and its reported probability (the enum returns only
-the selection, so no full distribution is claimed). For `score`, each level's
-support weight is the reported probability when the selected value is `true` and
+instructions and criteria. The reply is read from
+`results[0].fields.<qid> = {value, probability}`; the one-level wrapper shape (a
+lone `result` object holding the question map) is also recognized, so a question
+literally named `result` cannot be mistaken for the wrapper. `choice` records the
+selected option and its reported probability (the enum returns only the
+selection, so no full distribution is claimed). For `score`, each level's support
+weight is the reported probability when the selected value is `true` and
 `1 - probability` when it is `false` (a hard `1`/`0` when the endpoint omits a
 probability — a high probability for `false` is *low* support, never high). The
 weights are normalized into a level distribution and the record carries the

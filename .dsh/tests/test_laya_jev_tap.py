@@ -30,14 +30,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TSX = REPO_ROOT / "node_modules" / ".bin" / "tsx"
 
 # The impact-scoped TypeScript modules that verify the `laya-serve` surface;
-# `test_serve_jev_tap.ts` is the tap suite, `test_serve_device.ts` is the GPU
-# policy/ceiling suite and `test_serve_parity.ts` the fail-closed parity suite.
+# `test_serve_jev_tap.ts` is the tap suite, `test_serve_qwen4b.ts` the Qwen4b
+# third-shadow suite, `test_serve_device.ts` is the GPU policy/ceiling suite and
+# `test_serve_parity.ts` the fail-closed parity suite.
 SERVE_TEST_MODULES = (
     "test/test_serve_protocol.ts",
     "test/test_serve_device.ts",
     "test/test_serve_shadow.ts",
     "test/test_serve_http.ts",
     "test/test_serve_jev_tap.ts",
+    "test/test_serve_qwen4b.ts",
     "test/test_serve_parity.ts",
 )
 TIMEOUT_SECONDS = 900
