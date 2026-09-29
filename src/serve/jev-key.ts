@@ -61,8 +61,9 @@ export function redactSecret(text: string, secret: string | null): string {
   return (
     out
       .replace(/\b(?:bearer|basic)\s+([-a-z0-9._~+/=]+)/gi, (match, token: string) => (token.length >= 8 ? "[REDACTED]" : match))
-      // header- and assignment-style credentials, including inside a non-JSON body
-      .replace(/((?:authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret))\s*[:=]\s*[^\r\n,}]*/gi, "$1=[REDACTED]")
+      // header- and assignment-style credentials, including quoted JSON keys in
+      // an unparseable/non-JSON body (e.g. `{"api_key": "..."`)
+      .replace(/(["']?)((?:authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret))\1\s*[:=]\s*[^\r\n,}]*/gi, "$1$2$1=[REDACTED]")
   );
 }
 

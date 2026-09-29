@@ -500,6 +500,26 @@ test("scrubs a caller credential from a non-JSON payload before persisting it", 
   }
 });
 
+test("scrubs quoted credential keys from an unparseable body", async () => {
+  const quotedSecret = "caller-secret-token-999";
+  // direct unit checks across quoting styles
+  assert.ok(!redactSecret(`{"api_key": "${quotedSecret}", invalid_json`, null).includes(quotedSecret));
+  assert.ok(!redactSecret(`{'authorization': 'Bearer ${quotedSecret}', oops`, null).includes(quotedSecret));
+  assert.ok(!redactSecret(`{"access_token": "${quotedSecret}"}`, null).includes(quotedSecret));
+
+  const h = await setup();
+  try {
+    const res = await postTap(h, `{"api_key": "${quotedSecret}", invalid_json`);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.ok(!String(record.request).includes(quotedSecret), "a quoted credential key must be redacted");
+    assert.ok(!(await readFile(h.pairsFile, "utf8")).includes(quotedSecret));
+  } finally {
+    await h.close();
+  }
+});
+
 test("scrubs embedded bearer tokens, including all-alphabetic ones", async () => {
   const alphaToken = "SecretCallerTokenAlpha";
   assert.ok(!redactSecret(`Authorization: Bearer ${alphaToken}`, null).includes(alphaToken));
