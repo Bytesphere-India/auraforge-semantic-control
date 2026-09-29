@@ -1,4 +1,4 @@
-"""Polyglot conformance runner for the Jev shadow tap.
+"""Polyglot conformance runner for the Jev shadow tap (lane evidence entrypoint).
 
 The authoritative service tests are TypeScript (`tsx --test`, wired into
 `package.json` `"test"` per the brief).  This module lets a pytest-based CI run

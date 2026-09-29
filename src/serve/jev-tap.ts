@@ -200,7 +200,6 @@ export function createJevTap(options: JevTapOptions): JevTap {
       request_hash: prep.requestHash,
       payload_sha256: prep.payloadSha,
       request: prep.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(prep.parsed, options.apiKey, redacted, "request"),
-      redacted_fields: redacted.length > 0 ? redacted : undefined,
       forwarded: { url: upstreamUrl, content_type: mediaType(args.contentType) },
       jev: {
         status: args.forward.status,
@@ -209,13 +208,14 @@ export function createJevTap(options: JevTapOptions): JevTap {
         latency_ms: Math.max(0, Math.round(args.forward.latencyMs)),
         reply:
           args.forward.error === null && replyParsed !== undefined
-            ? sanitizeForStorage(replyParsed, options.apiKey)
+            ? sanitizeForStorage(replyParsed, options.apiKey, redacted, "jev.reply")
             : redactSecret(args.forward.body, options.apiKey),
         model: typeof replyRecord?.model === "string" ? replyRecord.model : null,
         usage,
         error: args.forward.error,
       },
       laya,
+      redacted_fields: redacted.length > 0 ? redacted : undefined,
     });
   };
 

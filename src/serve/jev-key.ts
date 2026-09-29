@@ -46,16 +46,20 @@ export function secretFingerprint(secret: string): string {
   return createHash("sha256").update(secret).digest("hex").slice(0, 12);
 }
 
-// A sensitive word matches at the start, after a separator, or after a
-// camelCase boundary (`apiToken`, `userPassword`), but not as a prefix of a
-// longer word (`input_tokens`). The ambiguous words `session`/`credential` match
-// only exactly, so `session_id`/`credential_type` stay usable domain fields.
+// Credential-name matching is word-based: camelCase and snake_case both split
+// into words, so `secretKey`/`userPassword` match while `input_tokens` (a token
+// *count*), `session_id` and `credential_type` (legitimate domain fields) do not.
 const SENSITIVE_KEY = /(authorization|api[_-]?key)/i;
-const SENSITIVE_WORD = /(?:^|[_-])(?:password|passwd|passphrase|secret|cookie|token)(?![a-z0-9])/i;
-const SENSITIVE_CAMEL = /[a-z0-9](?:password|passwd|passphrase|secret|cookie|token)(?![a-z0-9])/i;
 const SENSITIVE_AMBIGUOUS = /^(?:session|credential|credentials)$/i;
+const SENSITIVE_WORDS = new Set(["password", "passwd", "passphrase", "secret", "cookie", "token"]);
+const keyWords = (key: string): string[] =>
+  key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter((word) => word.length > 0)
+    .map((word) => word.toLowerCase());
 const isSensitiveKey = (key: string): boolean =>
-  SENSITIVE_KEY.test(key) || SENSITIVE_WORD.test(key) || SENSITIVE_CAMEL.test(key) || SENSITIVE_AMBIGUOUS.test(key);
+  SENSITIVE_KEY.test(key) || SENSITIVE_AMBIGUOUS.test(key) || keyWords(key).some((word) => SENSITIVE_WORDS.has(word));
 
 /** Redact a `key[:=]value` assignment when the key names a credential. */
 const redactAssignment = (match: string, quote: string, key: string): string => (isSensitiveKey(key) ? `${quote}${key}${quote}=[REDACTED]` : match);

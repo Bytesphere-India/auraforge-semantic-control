@@ -749,6 +749,22 @@ test("the shadow is dispatched only after the response handoff commits", async (
   }
 });
 
+test("committing the handoff twice still writes exactly one joined record", async () => {
+  const h = await setup();
+  try {
+    const tap = h.tap;
+    assert.ok(tap);
+    const handoff = await tap.handle(JSON.stringify(basePayload()), "tester", "application/json");
+    // the server registers both "finish" and "close"; a second commit must be a no-op
+    handoff.commit();
+    handoff.commit();
+    await tap.drain();
+    assert.equal((await h.records()).length, 1, "a double commit must not duplicate the joined record");
+  } finally {
+    await h.close();
+  }
+});
+
 test("keeps legitimate fields, withholds credentials, and marks what was redacted", async () => {
   const h = await setup();
   try {
@@ -805,6 +821,9 @@ test("withholds camelCase credential names while preserving camelCase domain fie
         userPassword: "s5",
         sessionCookie: "s6",
         apiSecret: "s7",
+        secretKey: "s8",
+        tokenValue: "s9",
+        passwordHash: "s10",
         sessionId: "sid",
         credentialType: "basic",
         inputTokens: 11,
@@ -816,7 +835,18 @@ test("withholds camelCase credential names while preserving camelCase domain fie
     const [record] = await h.waitForRecords(1);
     assert.ok(record);
     const state = rec(rec(record.request).state);
-    const secretKeys = ["apiToken", "authToken", "sessionToken", "refreshToken", "userPassword", "sessionCookie", "apiSecret"];
+    const secretKeys = [
+      "apiToken",
+      "authToken",
+      "sessionToken",
+      "refreshToken",
+      "userPassword",
+      "sessionCookie",
+      "apiSecret",
+      "secretKey",
+      "tokenValue",
+      "passwordHash",
+    ];
     for (const key of secretKeys) {
       assert.equal(state[key], "[REDACTED]", `${key} must be withheld (camelCase credential)`);
     }
@@ -835,6 +865,22 @@ test("withholds camelCase credential names while preserving camelCase domain fie
   }
 });
 
+test("marks redacted credential fields inside the upstream reply", async () => {
+  const h = await setup({ upstreamReply: { result: "ok", api_token: "token-123", usage: { input_tokens: 7, cost: 0.001 } } });
+  try {
+    const res = await postTap(h, basePayload());
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.equal(rec(rec(record.jev).reply).api_token, "[REDACTED]", "a credential in the reply must be withheld");
+    const redactedFields = record.redacted_fields as string[];
+    assert.ok(redactedFields.includes("jev.reply.api_token"), "the reply redaction must be marked in redacted_fields");
+    assert.ok(!redactedFields.some((path) => path.includes("input_tokens")), "usage token counts must not be listed");
+  } finally {
+    await h.close();
+  }
+});
+
 test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", () => {
   // build the scheme and the metadata address at runtime so fixture-only lint rules do not fire
   const httpUrl = (authority: string): string => ["http", "://", authority].join("");
@@ -845,7 +891,14 @@ test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", (
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(linkLocal)}/latest/meta-data/` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("0.0.0.0:9000")}/x` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("metadata.google.internal")}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("metadata")}/x` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("127.0.0.1:9000")}/x` }), /loopback/);
+
+  // standard /etc/hosts loopback aliases must be treated as loopback
+  for (const alias of ["localhost.localdomain", "ip6-localhost", "ip6-loopback"]) {
+    const aliasUrl = `${httpUrl(alias)}:8790/x`;
+    assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: aliasUrl }), /loopback/);
+  }
 
   // RFC1918 private space must be blocked, but adjacent public space must not
   const ip = (...parts: number[]): string => parts.join(".");
@@ -863,6 +916,10 @@ test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", (
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(mapped(linkLocal))}/x` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(mapped("7f00:1"))}/x` }), /loopback/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(compat("7f00:1"))}/x` }), /loopback/);
+
+  // RFC 6052 NAT64 well-known prefix must not bypass the IPv4 class checks
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("[64:ff9b::169.254.169.254]")}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("[64:ff9b::127.0.0.1]")}/x` }), /loopback/);
 
   // trailing root dots (FQDN form) must not bypass the gates
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("localhost.")}/x` }), /loopback/);

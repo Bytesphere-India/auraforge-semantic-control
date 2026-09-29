@@ -85,7 +85,7 @@ export function deriveModelId(modelDir: string): string {
   return base.startsWith("laya") ? base : `laya-${base}`;
 }
 
-const JEV_BLOCKED_HOSTNAMES = new Set(["metadata.google.internal", "metadata.goog"]);
+const JEV_BLOCKED_HOSTNAMES = new Set(["metadata", "metadata.google.internal", "metadata.goog"]);
 
 function unbracket(hostname: string): string {
   // strip the IPv6 brackets and any trailing root dots (`localhost.` -> `localhost`)
@@ -96,13 +96,13 @@ function unbracket(hostname: string): string {
 }
 
 /**
- * Decode an IPv4 address embedded in IPv6 (`::ffff:a.b.c.d`, `::a.b.c.d`, or the
- * normalized hex forms `::ffff:xxxx:xxxx`, `::xxxx:xxxx`) so mapped addresses
- * cannot bypass the IPv4 class checks. Returns a dotted quad, or null when the
- * host is not an embedded-IPv4 form.
+ * Decode an IPv4 address embedded in IPv6 (`::ffff:a.b.c.d`, `::a.b.c.d`, their
+ * normalized hex forms, and the RFC 6052 NAT64 well-known prefix
+ * `64:ff9b::a.b.c.d`) so mapped addresses cannot bypass the IPv4 class checks.
+ * Returns a dotted quad, or null when the host is not an embedded-IPv4 form.
  */
 function ipv4FromEmbedded(host: string): string | null {
-  const match = /^::(?:ffff:)?([0-9a-f:.]+)$/i.exec(host);
+  const match = /^(?:::ffff:|::|64:ff9b::|64:ff9b:1::)([0-9a-f:.]+)$/i.exec(host);
   if (!match) return null;
   const rest = match[1] ?? "";
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(rest)) return rest;
@@ -115,12 +115,15 @@ function ipv4FromEmbedded(host: string): string | null {
   return null;
 }
 
-/** loopback: 127.0.0.0/8, ::1, IPv4-mapped loopback and localhost. */
+/** standard loopback hostnames, including common Linux `/etc/hosts` aliases. */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"]);
+
+/** loopback: 127.0.0.0/8, ::1, IPv4-mapped/NAT64 loopback and loopback hostnames. */
 function isLoopbackHost(hostname: string): boolean {
   const host = unbracket(hostname);
   const mapped = ipv4FromEmbedded(host);
   if (mapped !== null) return /^127\./.test(mapped);
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (LOOPBACK_HOSTNAMES.has(host) || host.endsWith(".localhost") || host.endsWith(".localhost.localdomain")) return true;
   if (host === "::1") return true;
   return /^127\./.test(host);
 }
