@@ -7,8 +7,9 @@
  * of `noul`, of every probability, and of every score.
  *
  * Exit codes are fail-closed:
- *   0  parity measured, answer key sets identical
- *   2  the variant could not be loaded with the requested providers
+ *   0  parity measured, on the required execution provider, with identical keys
+ *   2  the variant (or its required GPU provider) could not be loaded; `"cpu"`
+ *      is never used to satisfy a GPU variant's session
  *   3  the variant answers are empty or their key set differs from the baseline
  *      (the check must never pass a non-functional/corrupt model as 0-diff)
  *
@@ -17,8 +18,9 @@
  *     --variant ~/models/laya/base-fp8 --providers tensorrt,cuda,cpu
  */
 import { Laya } from "../src/laya.js";
+import { probeProviders } from "../src/serve/device.js";
 import { FIXTURES } from "./fixtures.js";
-import { compareMetricKeys, metrics } from "./parity.js";
+import { compareMetricKeys, metrics, planVariantProviders } from "./parity.js";
 
 function arg(name: string): string | undefined {
   const index = process.argv.indexOf(name);
@@ -40,14 +42,29 @@ async function main(): Promise<void> {
     .split(",")
     .map((p) => p.trim())
     .filter(Boolean);
+  // A GPU variant must be validated on the GPU EP, never on a silent CPU fallback.
+  const plan = planVariantProviders(providers);
 
   const baseline = await Laya.load({ modelDir: baselineDir, executionProviders: ["cpu"] });
+
+  if (plan.gpuRequested) {
+    const probe = await probeProviders(plan.loadProviders);
+    if (!probe.available) {
+      process.stdout.write(
+        `${JSON.stringify({ ok: false, variant: variantDir, providers, load_providers: plan.loadProviders, reason: "GPU_PROVIDER_UNAVAILABLE", detail: probe.reason }, null, 2)}\n`,
+      );
+      await baseline.close();
+      process.exit(2);
+      return;
+    }
+  }
+
   let variant: Laya;
   try {
-    variant = await Laya.load({ modelDir: variantDir, executionProviders: providers });
+    variant = await Laya.load({ modelDir: variantDir, executionProviders: plan.loadProviders });
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    process.stdout.write(`${JSON.stringify({ ok: false, variant: variantDir, providers, reason }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ ok: false, variant: variantDir, providers, load_providers: plan.loadProviders, reason }, null, 2)}\n`);
     await baseline.close();
     process.exit(2);
     return;
@@ -67,6 +84,7 @@ async function main(): Promise<void> {
           ok: false,
           variant: variantDir,
           providers,
+          load_providers: plan.loadProviders,
           fixture: fixture.name,
           reason: keys.reason,
           missing_in_variant: keys.missing_in_variant,
@@ -81,7 +99,15 @@ async function main(): Promise<void> {
         if (!Number.isFinite(delta)) {
           // Belt and braces: compareMetricKeys already rejects non-finite values,
           // but a NaN delta must never be silently folded into a 0-max case.
-          throw new ParityError({ ok: false, variant: variantDir, providers, fixture: fixture.name, reason: "NON_FINITE_METRIC", non_finite_keys: [key] });
+          throw new ParityError({
+            ok: false,
+            variant: variantDir,
+            providers,
+            load_providers: plan.loadProviders,
+            fixture: fixture.name,
+            reason: "NON_FINITE_METRIC",
+            non_finite_keys: [key],
+          });
         }
         diffs[key] = delta;
         if (key.endsWith(".noul")) maxNoul = Math.max(maxNoul, delta);
@@ -111,6 +137,8 @@ async function main(): Promise<void> {
         ok: true,
         baseline: baselineDir,
         variant: variantDir,
+        requested_providers: providers,
+        load_providers: plan.loadProviders,
         variant_providers: variant.providers,
         baseline_providers: baseline.providers,
         max_abs_diff_noul: maxNoul,

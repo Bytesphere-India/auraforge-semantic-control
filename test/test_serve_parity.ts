@@ -5,8 +5,22 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compareMetricKeys, metrics, nonFiniteMetricKeys } from "../scripts/parity.js";
+import { compareMetricKeys, metrics, nonFiniteMetricKeys, planVariantProviders } from "../scripts/parity.js";
 import type { Question, SystemOneResult } from "../src/types.js";
+
+test("planVariantProviders strips cpu from a GPU stack so parity cannot pass on CPU", () => {
+  const gpu = planVariantProviders(["tensorrt", "cuda", "cpu"]);
+  assert.equal(gpu.gpuRequested, true);
+  assert.deepEqual(gpu.loadProviders, ["tensorrt", "cuda"]);
+
+  const cudaOnly = planVariantProviders(["cuda", "cpu"]);
+  assert.equal(cudaOnly.gpuRequested, true);
+  assert.deepEqual(cudaOnly.loadProviders, ["cuda"]);
+
+  const cpu = planVariantProviders(["cpu"]);
+  assert.equal(cpu.gpuRequested, false);
+  assert.deepEqual(cpu.loadProviders, ["cpu"]);
+});
 
 test("compareMetricKeys accepts identical non-empty key sets", () => {
   const diff = compareMetricKeys({ "a.noul": 0.1, "a.confidence": 0.2 }, { "a.noul": 0.9, "a.confidence": 0.8 });

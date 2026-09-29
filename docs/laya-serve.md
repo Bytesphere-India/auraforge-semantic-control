@@ -363,13 +363,15 @@ python3 scripts/quantize-laya.py --variant nvfp4   # falls back fp8, then fp16
 onnxruntime's CUDA EP cannot execute FP8/NVFP4: those need the **TensorRT EP**,
 which requires `libnvinfer.so.*` on `LD_LIBRARY_PATH` (from the TensorRT pip
 wheel). The variants form a **fallback chain**: a variant is `"ok"` only when its
-quantization _and_ answer parity both pass, and the script stops at the first
-`"ok"` variant (so fp16 is built only when fp8 did not clear both gates; skipped
-variants are recorded as `"skipped"` with the reason, and
-`fallback_stopped_after` names the winner). A variant that quantizes but cannot
-load on the required EP, or fails parity, is recorded as `"failed"` and is not
-counted as produced. fp32 remains the default until answer parity against it is
-measured with `yarn bench:latency` plus the parity check below.
+quantization _and_ answer parity both pass **on the provider it requires**
+(fp8/nvfp4 → `tensorrt,cuda`, fp16 → `cuda`; `"cpu"` is never in the required
+stack), and the script stops at the first `"ok"` variant (so fp16 is built only
+when fp8 did not clear both gates; skipped variants are recorded as `"skipped"`
+with the reason, and `fallback_stopped_after` names the winner). A variant that
+quantizes but cannot load on its required GPU EP, or fails parity, is recorded as
+`"failed"` and is not counted as produced — it can never pass on a silent CPU
+fallback. fp32 remains the default until answer parity against it is measured
+with `yarn bench:latency` plus the parity check below.
 
 ## Install (systemd user unit)
 
@@ -415,10 +417,13 @@ on the repo test fixtures and reports the maximum absolute difference of `noul`
 `scripts/check-parity.ts` exits 3 with `ok:false` when the variant returns an
 empty answer set, a key set that differs from the baseline, **or any `NaN`/infinite
 metric** (a non-finite delta must never be folded into a zero-difference pass), so
-a corrupt model can never be reported as passing parity (exit 2 means the variant
-could not load with the requested providers). A variant is only eligible for
-`LAYA_SERVE_DEVICE=cuda` once the parity number is recorded; fp32 stays the
-default until then.
+a corrupt model can never be reported as passing parity. Exit 2 means the variant
+— or its **required GPU provider** — could not be loaded: `check-parity.ts`
+removes `"cpu"` from a GPU variant's provider stack and probes the GPU stack
+first (`planVariantProviders` + `probeProviders`), so a TensorRT/CUDA init
+failure is a hard failure, never a CPU-backed parity pass that would stop the
+fp16 fallback. A variant is only eligible for `LAYA_SERVE_DEVICE=cuda` once the
+parity number is recorded; fp32 stays the default until then.
 
 ## Sample run (2026-09-28, base-fp32)
 

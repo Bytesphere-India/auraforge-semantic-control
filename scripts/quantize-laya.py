@@ -288,49 +288,53 @@ def try_fp16(src: Path, variant_dir: Path) -> tuple[bool, str]:
         return False, f"{type(error).__name__}: {error}"
 
 
-def run_parity(baseline: Path, variant_dir: Path) -> dict[str, object]:
-    """Answer parity via onnxruntime-node; TensorRT EP first, then CUDA/CPU."""
+# The provider each variant must actually run on. `"cpu"` is deliberately absent:
+# a GPU variant validated through a silent CPU fallback would wrongly pass parity
+# and stop the fp16 fallback. fp8/nvfp4 need the TensorRT EP; fp16 needs CUDA.
+REQUIRED_PROVIDERS = {
+    "base-nvfp4": "tensorrt,cuda",
+    "base-fp8": "tensorrt,cuda",
+    "base-fp16": "cuda",
+}
+
+
+def required_providers(mode: str) -> str:
+    """The GPU provider stack a variant must load on (never `cpu`)."""
+    return REQUIRED_PROVIDERS.get(mode, "cuda")
+
+
+def run_parity(baseline: Path, variant_dir: Path, providers: str) -> dict[str, object]:
+    """Answer parity via onnxruntime-node on the variant's required GPU stack.
+
+    `providers` names GPU providers only; `check-parity.ts` strips any `cpu`
+    entry and probes the GPU stack first, so an unavailable EP returns exit 2
+    (failed) instead of passing parity on a CPU-backed session.
+    """
     tsx = REPO / "node_modules" / ".bin" / "tsx"
     script = REPO / "scripts" / "check-parity.ts"
-    attempts = ["tensorrt,cuda,cpu", "cuda,cpu", "cpu"]
-    last: dict[str, object] = {"ok": False, "reason": "not attempted"}
-    for providers in attempts:
-        command = [
-            str(tsx),
-            str(script),
-            "--baseline",
-            str(baseline),
-            "--variant",
-            str(variant_dir),
-            "--providers",
-            providers,
-        ]
-        result = subprocess.run(command, cwd=str(REPO), text=True, capture_output=True)  # noqa: S603
-        if result.returncode == 0:
-            try:
-                parsed = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                last = {"ok": False, "providers": providers, "reason": "unparseable parity output", "stdout": result.stdout[-2000:]}
-                continue
-            parsed["attempted_providers"] = providers
-            return parsed
-        if result.returncode == 2:
-            try:
-                last = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                last = {"ok": False, "providers": providers, "reason": result.stdout[-2000:] or result.stderr[-2000:]}
-            last["attempted_providers"] = providers
-            continue
-        if result.returncode == 3:
-            # Fail-closed parity (empty/missing answers): terminal, not a provider problem.
-            try:
-                last = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                last = {"ok": False, "providers": providers, "reason": result.stdout[-2000:] or result.stderr[-2000:]}
-            last["attempted_providers"] = providers
-            return last
-        last = {"ok": False, "providers": providers, "reason": result.stderr[-2000:] or result.stdout[-2000:]}
-    return last
+    command = [
+        str(tsx),
+        str(script),
+        "--baseline",
+        str(baseline),
+        "--variant",
+        str(variant_dir),
+        "--providers",
+        providers,
+    ]
+    result = subprocess.run(command, cwd=str(REPO), text=True, capture_output=True)  # noqa: S603
+    if result.returncode in (0, 2, 3):
+        try:
+            parsed = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            parsed = None
+    else:
+        parsed = None
+    if not isinstance(parsed, dict):
+        parsed = {"ok": False, "providers": providers, "reason": result.stdout[-2000:] or result.stderr[-2000:]}
+    parsed["attempted_providers"] = providers
+    parsed["exit_code"] = result.returncode
+    return parsed
 
 
 def build_variant(args: argparse.Namespace, mode: str, variant_dir: Path, calib: dict[str, object]) -> dict[str, object]:
@@ -356,11 +360,12 @@ def build_variant(args: argparse.Namespace, mode: str, variant_dir: Path, calib:
         "nvfp4_note": NVFP4_NOTE,
     }
     if ok and not args.no_parity:
-        log(f"checking answer parity for {mode}")
-        parity = run_parity(src, variant_dir)
+        providers = required_providers(mode)
+        log(f"checking answer parity for {mode} on {providers}")
+        parity = run_parity(src, variant_dir, providers)
         manifest["parity"] = parity
         if not parity.get("ok", False):
-            # A variant that cannot load with the required EP, or fails answer
+            # A variant that cannot load on its required GPU EP, or fails answer
             # parity, is not "ok" and must not stop the fallback chain.
             manifest["status"] = "failed"
             manifest["reason"] = f"parity failed: {parity.get('reason') or parity.get('attempted_providers') or 'unknown'}"

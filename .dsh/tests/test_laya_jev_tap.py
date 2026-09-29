@@ -83,7 +83,7 @@ def _load_quantize_module() -> ModuleType:
 
 
 def test_quantize_parity_gates_status_and_fallback(tmp_path: Path) -> None:
-    """A variant is only "ok" when parity passes, and fp16 is a fallback, not a sibling."""
+    """A variant is only "ok" when its required GPU parity passes, and fp16 is a fallback."""
     quantize = _load_quantize_module()
 
     # Fallback chain: fp16 is only attempted when fp8/parity did not succeed.
@@ -92,19 +92,39 @@ def test_quantize_parity_gates_status_and_fallback(tmp_path: Path) -> None:
     assert quantize.fallback_order("base-fp8", False) == ["base-fp8"]
     assert quantize.fallback_order("base-nvfp4", False) == []
 
-    # build_variant: quantization success + parity failure must be "failed".
+    # Required providers never include cpu: a GPU variant must not pass parity on
+    # a silent CPU fallback (that would stop the fp16 fallback).
+    assert quantize.required_providers("base-fp8") == "tensorrt,cuda"
+    assert quantize.required_providers("base-nvfp4") == "tensorrt,cuda"
+    assert quantize.required_providers("base-fp16") == "cuda"
+    assert "cpu" not in quantize.required_providers("base-fp8")
+    assert "cpu" not in quantize.required_providers("base-fp16")
+
+    # build_variant: quantization success + parity failure must be "failed", and
+    # parity must be asked for the GPU stack (no cpu).
     src = tmp_path / "src"
     (src / "tokenizer").mkdir(parents=True)
     (src / "laya_config.json").write_text("{}", encoding="utf8")
     (src / "tokenizer" / "tokenizer.json").write_text("{}", encoding="utf8")
     args = argparse.Namespace(src=src, no_parity=False)
 
+    parity_calls: list[str] = []
+
+    def fake_parity(_baseline: Path, _variant: Path, providers: str) -> dict[str, object]:
+        parity_calls.append(providers)
+        return {"ok": False, "reason": "GPU_PROVIDER_UNAVAILABLE"}
+
     quantize.try_fp8 = lambda *a, **k: (True, "")
-    quantize.run_parity = lambda *a, **k: {"ok": False, "reason": "NON_FINITE_METRIC"}
+    quantize.run_parity = fake_parity
     failed = quantize.build_variant(args, "base-fp8", tmp_path / "out-failed", {})
     assert failed["status"] == "failed", failed
     assert "parity failed" in str(failed["reason"]), failed
 
-    quantize.run_parity = lambda *a, **k: {"ok": True, "max_abs_diff_noul": 0}
+    def fake_parity_ok(_baseline: Path, _variant: Path, providers: str) -> dict[str, object]:
+        parity_calls.append(providers)
+        return {"ok": True, "max_abs_diff_noul": 0}
+
+    quantize.run_parity = fake_parity_ok
     passed = quantize.build_variant(args, "base-fp8", tmp_path / "out-ok", {})
     assert passed["status"] == "ok", passed
+    assert parity_calls == ["tensorrt,cuda", "tensorrt,cuda"], parity_calls

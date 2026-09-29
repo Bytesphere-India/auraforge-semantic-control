@@ -68,3 +68,26 @@ export function compareMetricKeys(baseline: Record<string, number>, variant: Rec
   if (nonFinite.length > 0) return { ok: false, reason: "NON_FINITE_METRIC", non_finite_keys: nonFinite };
   return { ok: true };
 }
+
+export interface VariantProviderPlan {
+  /** true when at least one requested provider is a GPU provider */
+  gpuRequested: boolean;
+  /** providers to open the variant session with; `"cpu"` is dropped for GPU loads */
+  loadProviders: string[];
+}
+
+/**
+ * The variant session must load on the providers the variant actually needs.
+ *
+ * A GPU variant (fp8/nvfp4 on TensorRT, fp16 on CUDA) must never be validated
+ * through a session that silently fell back to `"cpu"`: ONNX Runtime accepts a
+ * mixed list like `["tensorrt", "cuda", "cpu"]` and can satisfy it on CPU when
+ * the GPU provider fails to initialize, which would mark the variant `"ok"` and
+ * stop the fp16 fallback. So for a GPU load the `"cpu"` entry is removed, making
+ * a GPU init failure throw (exit 2) instead of passing parity.
+ */
+export function planVariantProviders(providers: string[]): VariantProviderPlan {
+  const gpuRequested = providers.some((provider) => provider.toLowerCase() !== "cpu");
+  const loadProviders = gpuRequested ? providers.filter((provider) => provider.toLowerCase() !== "cpu") : ["cpu"];
+  return { gpuRequested, loadProviders };
+}
