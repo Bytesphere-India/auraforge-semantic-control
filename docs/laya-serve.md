@@ -52,15 +52,17 @@ llama-server, subject to two non-negotiables:
    (`src/serve/device.ts`) but are **not honoured by the binding**, so the
    ceiling is enforced in code and verified by measuring the total GPU delta.
    fp32 on CUDA adds ≈ 2337 MiB before any inference, so a bundle is refused on
-   the GPU before any session/probe when its directory name says `fp32`, when
-   `laya.onnx` + `laya.onnx.data` (embedded or external weights) exceed the
-   budget **derived from `LAYA_SERVE_GPU_MEM_MB`** (`gpuWeightsBudgetBytes` =
-   ceiling − 1024 MiB context reserve, i.e. 1 GiB at the default 2048 MiB
-   ceiling), **or when neither file can be measured at all** (`gpuCeilingViolation`
-   fails closed — an unverifiable bundle is never assumed small); the request is
-   downgraded to CPU and logged. Lowering `LAYA_SERVE_GPU_MEM_MB` therefore
-   tightens the enforced gate (e.g. 1536 MiB admits only 512 MiB of weights),
-   while a value above the hard 2048 MiB ceiling never raises the budget.
+   the GPU before any session/probe when its directory name says `fp32`, when the
+   total size of **every file in the bundle** (embedded or external weights,
+   whatever their names — ONNX external-data `location` is arbitrary and may be
+   renamed or nested) exceeds the budget **derived from `LAYA_SERVE_GPU_MEM_MB`**
+   (`gpuWeightsBudgetBytes` = ceiling − 1024 MiB context reserve, i.e. 1 GiB at
+   the default 2048 MiB ceiling), **or when the bundle cannot be measured at all**
+   (`gpuCeilingViolation` fails closed — an unverifiable bundle is never assumed
+   small); the request is downgraded to CPU and logged. Lowering
+   `LAYA_SERVE_GPU_MEM_MB` tightens the enforced gate (e.g. 1536 MiB admits only
+   512 MiB of weights), and a value above the hard 2048 MiB ceiling is clamped —
+   for both the weight budget and the `gpu_mem_limit` advertised to the CUDA EP.
    Only a small quantized variant (nvfp4 / fp8 / fp16, ≈ 0.8 GiB) may be promoted
    to CUDA, and only after its measured total delta is ≤ 2048 MiB.
 2. **Never crowd out NInfer.** The provider list is `["cuda", "cpu"]`, so

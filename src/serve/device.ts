@@ -24,7 +24,7 @@
  * provider stack can actually initialize before any identity claims `cuda`, and
  * by the (skipping) GPU test and the latency bench.
  */
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import * as ort from "onnxruntime-node";
 import { Laya, type LayaOptions } from "../laya.js";
@@ -75,6 +75,15 @@ export const GPU_CONTEXT_OVERHEAD_MB = 1024;
 export const HARD_GPU_MEM_MB = 2048;
 
 /**
+ * The effective ceiling: `LAYA_SERVE_GPU_MEM_MB` may tighten the brief's hard
+ * 2048 MiB ceiling but never raise it. Used for both the enforced weight budget
+ * and the value advertised to the CUDA EP, so the two can never disagree.
+ */
+export function effectiveGpuMemMb(gpuMemMb: number): number {
+  return Math.min(gpuMemMb, HARD_GPU_MEM_MB);
+}
+
+/**
  * Weight budget (bytes) implied by the configured VRAM ceiling. The hard 2048 MiB
  * ceiling therefore admits 1 GiB of weights; a lower `LAYA_SERVE_GPU_MEM_MB`
  * admits proportionally less (and 0 at or below the context reserve). Values
@@ -82,8 +91,7 @@ export const HARD_GPU_MEM_MB = 2048;
  * raised from the environment.
  */
 export function gpuWeightsBudgetBytes(gpuMemMb: number): number {
-  const effective = Math.min(gpuMemMb, HARD_GPU_MEM_MB);
-  return Math.max(0, effective - GPU_CONTEXT_OVERHEAD_MB) * 1024 * 1024;
+  return Math.max(0, effectiveGpuMemMb(gpuMemMb) - GPU_CONTEXT_OVERHEAD_MB) * 1024 * 1024;
 }
 
 function integer(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
@@ -136,7 +144,7 @@ export function loadDeviceConfig(env: NodeJS.ProcessEnv = process.env): DeviceCo
   return {
     requested: rawDevice,
     providers,
-    gpuMemMb: integer(env, "LAYA_SERVE_GPU_MEM_MB", 2048, 1, MAX_GPU_MEM_MB),
+    gpuMemMb: effectiveGpuMemMb(integer(env, "LAYA_SERVE_GPU_MEM_MB", 2048, 1, MAX_GPU_MEM_MB)),
     gpuDeviceId: integer(env, "LAYA_SERVE_GPU_DEVICE_ID", 0, 0, 1024),
     intraOpThreads: optionalInteger(env, "LAYA_SERVE_INTRA_OP_THREADS", 1, 4096),
     interOpThreads: optionalInteger(env, "LAYA_SERVE_INTER_OP_THREADS", 1, 4096),
@@ -172,7 +180,8 @@ function cudaProvider(cfg: DeviceConfig): ort.InferenceSession.ExecutionProvider
   return {
     name: "cuda",
     deviceId: cfg.gpuDeviceId,
-    gpu_mem_limit: cfg.gpuMemMb * 1024 * 1024,
+    // Advertise the effective ceiling, never a value above the brief's hard cap.
+    gpu_mem_limit: effectiveGpuMemMb(cfg.gpuMemMb) * 1024 * 1024,
     arena_extend_strategy: "kSameAsRequested",
   } as unknown as ort.InferenceSession.ExecutionProviderConfig;
 }
@@ -191,24 +200,52 @@ export function isFp32ModelDir(modelDir: string): boolean {
 }
 
 /**
- * Total weight bytes for a bundle: `laya.onnx` plus `laya.onnx.data` when
- * present, or null when neither file can be read.
+ * Total byte size of every file in a bundle, recursively, or null when nothing
+ * can be read.
  *
- * The ONNX export stores weights externally (`laya.onnx.data`), but a single-file
- * model embeds them in `laya.onnx`; measuring only the `.data` file would report
- * 3.8 MB for a full 1.6 GB fp32 graph and let it onto the GPU.
+ * ONNX weights may be embedded in `laya.onnx`, or stored externally in a file
+ * whose name is arbitrary (`external_data` `location` in the graph, not
+ * necessarily `laya.onnx.data`) and may live in a subdirectory. Summing only two
+ * fixed names would let a bundle hide gigabytes under a renamed `.bin` and slip
+ * past the ceiling as "small", so we deliberately over-count: every regular file
+ * in the bundle counts toward the budget. Over-counting fails closed (a bundle
+ * with unrelated large files is refused the GPU), which is the safe direction.
  */
 export function weightsByteLength(modelDir: string): number | null {
   let total = 0;
   let found = false;
-  for (const file of ["laya.onnx", "laya.onnx.data"]) {
+  const seen = new Set<string>();
+  const walk = (dir: string): void => {
+    let real: string;
     try {
-      total += statSync(path.join(modelDir, file)).size;
-      found = true;
+      real = realpathSync(dir);
+      if (seen.has(real)) return; // guard against symlink loops
+      seen.add(real);
     } catch {
-      // absent (or unreadable): the other file may still be measurable
+      return;
     }
-  }
+    let entries: string[];
+    try {
+      entries = readdirSync(real);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const full = path.join(real, name);
+      let stats: ReturnType<typeof statSync>;
+      try {
+        stats = statSync(full); // follows symlinks, so a link cannot hide size
+      } catch {
+        continue;
+      }
+      if (stats.isDirectory()) walk(full);
+      else {
+        total += stats.size;
+        found = true;
+      }
+    }
+  };
+  walk(modelDir);
   return found ? total : null;
 }
 
@@ -226,9 +263,10 @@ export function weightsByteLength(modelDir: string): number | null {
 export function gpuCeilingViolation(modelDir: string, weightsBytes: number | null, gpuMemMb: number): string | null {
   if (isFp32ModelDir(modelDir)) return `model directory ${path.basename(path.resolve(modelDir))} is the unquantized fp32 bundle`;
   if (weightsBytes === null) return `weight size could not be verified under ${path.resolve(modelDir)}`;
-  const budget = gpuWeightsBudgetBytes(gpuMemMb);
+  const ceiling = effectiveGpuMemMb(gpuMemMb);
+  const budget = gpuWeightsBudgetBytes(ceiling);
   if (weightsBytes > budget) {
-    return `weights are ${weightsBytes} bytes, over the ${budget}-byte GPU budget for the ${gpuMemMb} MiB ceiling`;
+    return `weights are ${weightsBytes} bytes, over the ${budget}-byte GPU budget for the ${ceiling} MiB ceiling`;
   }
   return null;
 }

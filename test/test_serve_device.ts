@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Laya, LayaOptions } from "../src/laya.js";
@@ -76,6 +76,11 @@ test("loadDeviceConfig rejects malformed values", () => {
   assert.throws(() => loadDeviceConfig({ LAYA_SERVE_INTRA_OP_THREADS: "0" }), /LAYA_SERVE_INTRA_OP_THREADS/);
 });
 
+test("loadDeviceConfig clamps LAYA_SERVE_GPU_MEM_MB to the hard 2048 MiB ceiling", () => {
+  assert.equal(loadDeviceConfig({ LAYA_SERVE_GPU_MEM_MB: "8192" }).gpuMemMb, 2048, "an operator cannot raise the hard ceiling");
+  assert.equal(loadDeviceConfig({ LAYA_SERVE_GPU_MEM_MB: "1536" }).gpuMemMb, 1536, "tightening is allowed");
+});
+
 test("buildExecutionProviders advertises the VRAM ceiling and caps CUDA with cpu fallback", () => {
   const cuda = buildExecutionProviders(loadDeviceConfig({ LAYA_SERVE_GPU_MEM_MB: "2048", LAYA_SERVE_GPU_DEVICE_ID: "1" }));
   assert.equal(cuda.length, 2);
@@ -84,6 +89,9 @@ test("buildExecutionProviders advertises the VRAM ceiling and caps CUDA with cpu
   assert.equal(primary.deviceId, 1);
   assert.equal(primary.gpu_mem_limit, 2048 * 1024 * 1024);
   assert.equal(primary.arena_extend_strategy, "kSameAsRequested");
+  // The advertised limit is clamped to the hard ceiling, same as the enforced budget.
+  const huge = buildExecutionProviders(loadDeviceConfig({ LAYA_SERVE_GPU_MEM_MB: "8192" }))[0] as unknown as { gpu_mem_limit: number };
+  assert.equal(huge.gpu_mem_limit, 2048 * 1024 * 1024);
   const fallback = cuda[1];
   assert.ok(fallback);
   assert.equal(providerName(fallback), "cpu");
@@ -135,7 +143,7 @@ test("gpuCeilingViolation fails closed on fp32, oversized and unverifiable bundl
   assert.match(gpuCeilingViolation("/models/laya/base-fp16", 800_000_000, 1536) ?? "", /budget for the 1536 MiB ceiling/);
 });
 
-test("weightsByteLength measures embedded and external weights, or reports null", async () => {
+test("weightsByteLength counts embedded, renamed and nested external data, or reports null", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "laya-weights-"));
   try {
     assert.equal(weightsByteLength(dir), null, "an empty directory has no verifiable weights");
@@ -143,6 +151,12 @@ test("weightsByteLength measures embedded and external weights, or reports null"
     assert.equal(weightsByteLength(dir), 100, "a single-file model embeds its weights in laya.onnx");
     await writeFile(path.join(dir, "laya.onnx.data"), Buffer.alloc(250, 2));
     assert.equal(weightsByteLength(dir), 350, "external data adds to the graph size");
+    // ONNX external-data `location` is arbitrary: a renamed file must still count.
+    await writeFile(path.join(dir, "weights.renamed"), Buffer.alloc(400, 3));
+    assert.equal(weightsByteLength(dir), 750, "renamed external data is counted");
+    await mkdir(path.join(dir, "nested"));
+    await writeFile(path.join(dir, "nested", "more.bin"), Buffer.alloc(50, 4));
+    assert.equal(weightsByteLength(dir), 800, "nested external data is counted");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -219,6 +233,34 @@ test("loadEngine tracks LAYA_SERVE_GPU_MEM_MB: a lower ceiling refuses a bundle 
   assert.deepEqual(calls, [["cpu"]]);
   assert.equal(probes, 0);
   assert.match(outcome.ceiling?.reason ?? "", /1536 MiB ceiling/);
+});
+
+test("loadEngine measures the real bundle directory, so renamed external data cannot hide weights", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "laya-bundle-"));
+  try {
+    // A small graph with the real weights in a file ONNX is free to name anything.
+    await writeFile(path.join(dir, "laya.onnx"), Buffer.alloc(100, 1));
+    await writeFile(path.join(dir, "renamed-external-weights.bin"), Buffer.alloc(2 * 1024 * 1024, 2));
+    const calls: string[][] = [];
+    let probes = 0;
+    const outcome = await loadEngine({
+      modelDir: dir,
+      // budget = (1025 - 1024) MiB = 1 MiB < the ~2 MiB bundle
+      cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda", LAYA_SERVE_GPU_MEM_MB: "1025" }),
+      load: collectLoader(calls),
+      probe: async () => {
+        probes += 1;
+        return { available: true, reason: null };
+      },
+      log: () => undefined,
+    });
+    assert.equal(outcome.device, "cpu");
+    assert.deepEqual(calls, [["cpu"]]);
+    assert.equal(probes, 0, "the size gate must run before the GPU probe");
+    assert.match(outcome.ceiling?.reason ?? "", /GPU budget for the 1025 MiB ceiling/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("loadEngine allows a small quantized bundle on the verified GPU path", async () => {
