@@ -52,15 +52,19 @@ llama-server, subject to two non-negotiables:
    (`src/serve/device.ts`) but are **not honoured by the binding**, so the
    ceiling is enforced in code and verified by measuring the total GPU delta.
    fp32 on CUDA adds ≈ 2337 MiB before any inference, so a bundle is refused on
-   the GPU before any session/probe when its directory name says `fp32` or its
-   `laya.onnx.data` is over 1 GiB (`gpuCeilingViolation`); the request is
+   the GPU before any session/probe when its directory name says `fp32`, when
+   `laya.onnx` + `laya.onnx.data` (embedded or external weights) total over 1 GiB,
+   **or when neither file can be measured at all** (`gpuCeilingViolation` fails
+   closed — an unverifiable bundle is never assumed small); the request is
    downgraded to CPU and logged. Only a small quantized variant
    (nvfp4 / fp8 / fp16, ≈ 0.8 GiB) may be promoted to CUDA, and only after its
    measured total delta is ≤ 2048 MiB.
 2. **Never crowd out NInfer.** The provider list is `["cuda", "cpu"]`, so
    unsupported nodes fall back per-node rather than failing the session. Before
    the real session opens, the exact provider stack is exercised on a 95-byte
-   Relu fixture (`probeProviders`); if it cannot initialize, the service logs and
+   Relu fixture (`probeProviders`); the `"cpu"` fallback entry is stripped for
+   the probe (`gpuOnlyProviders`) so a failed GPU init cannot be satisfied on CPU
+   and reported as success. If the probe cannot initialize, the service logs and
    starts on CPU, so `/health` never claims `cuda` for a stack that cannot run.
    Startup then warms the session with one dummy inference so steady-state
    latency is not paid by the first caller.
@@ -358,9 +362,14 @@ python3 scripts/quantize-laya.py --variant nvfp4   # falls back fp8, then fp16
 
 onnxruntime's CUDA EP cannot execute FP8/NVFP4: those need the **TensorRT EP**,
 which requires `libnvinfer.so.*` on `LD_LIBRARY_PATH` (from the TensorRT pip
-wheel). When the TensorRT EP cannot load a variant, the script records that and
-falls back to fp16 on the CUDA EP. fp32 remains the default until answer parity
-against it is measured with `yarn bench:latency` plus the parity check below.
+wheel). The variants form a **fallback chain**: a variant is `"ok"` only when its
+quantization _and_ answer parity both pass, and the script stops at the first
+`"ok"` variant (so fp16 is built only when fp8 did not clear both gates; skipped
+variants are recorded as `"skipped"` with the reason, and
+`fallback_stopped_after` names the winner). A variant that quantizes but cannot
+load on the required EP, or fails parity, is recorded as `"failed"` and is not
+counted as produced. fp32 remains the default until answer parity against it is
+measured with `yarn bench:latency` plus the parity check below.
 
 ## Install (systemd user unit)
 
@@ -404,9 +413,10 @@ The CUDA probe test skips cleanly when no GPU/CUDA driver is reachable; the
 on the repo test fixtures and reports the maximum absolute difference of `noul`
 (and of each score level/choice probability). The comparison **fails closed**:
 `scripts/check-parity.ts` exits 3 with `ok:false` when the variant returns an
-empty answer set or a key set that differs from the baseline, so a corrupt model
-can never be reported as a zero-difference pass (exit 2 means the variant could
-not load with the requested providers). A variant is only eligible for
+empty answer set, a key set that differs from the baseline, **or any `NaN`/infinite
+metric** (a non-finite delta must never be folded into a zero-difference pass), so
+a corrupt model can never be reported as passing parity (exit 2 means the variant
+could not load with the requested providers). A variant is only eligible for
 `LAYA_SERVE_DEVICE=cuda` once the parity number is recorded; fp32 stays the
 default until then.
 

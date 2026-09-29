@@ -1,10 +1,11 @@
 /**
  * Pure answer-parity helpers for `scripts/check-parity.ts`.
  *
- * Kept free of onnxruntime imports so the fail-closed key comparison can be
+ * Kept free of onnxruntime imports so the fail-closed comparison can be
  * unit-tested offline. `metrics` flattens an answer set into
  * `<question>.<field>` numbers; `compareMetricKeys` refuses to compare anything
- * unless the baseline and the variant expose exactly the same fields.
+ * unless the baseline and the variant expose exactly the same fields **and every
+ * value is finite** (NaN/Infinity must never look like a zero-difference pass).
  */
 import type { Answer, Question, SystemOneResult } from "../src/types.js";
 
@@ -26,7 +27,7 @@ export function metrics(result: SystemOneResult<Record<string, Question>>): Reco
   return out;
 }
 
-export type ParityKeyFailure = "BASELINE_EMPTY" | "VARIANT_EMPTY" | "ANSWER_KEY_MISMATCH";
+export type ParityKeyFailure = "BASELINE_EMPTY" | "VARIANT_EMPTY" | "ANSWER_KEY_MISMATCH" | "NON_FINITE_METRIC";
 
 export interface ParityKeyDiff {
   ok: boolean;
@@ -35,11 +36,22 @@ export interface ParityKeyDiff {
   missing_in_variant?: string[];
   /** keys the variant produced that the baseline did not */
   missing_in_baseline?: string[];
+  /** keys whose baseline or variant value is NaN/±Infinity */
+  non_finite_keys?: string[];
+}
+
+/** Metric keys whose value is not finite in either answer set (deduped, sorted). */
+export function nonFiniteMetricKeys(baseline: Record<string, number>, variant: Record<string, number>): string[] {
+  const keys = new Set<string>();
+  for (const [key, value] of Object.entries(baseline)) if (!Number.isFinite(value)) keys.add(key);
+  for (const [key, value] of Object.entries(variant)) if (!Number.isFinite(value)) keys.add(key);
+  return [...keys].sort((a, b) => a.localeCompare(b));
 }
 
 /**
- * Fail closed: the two answer sets must have exactly the same non-empty key set.
- * A variant that returns `{}` or silently drops a question must never look like a
+ * Fail closed: the two answer sets must have exactly the same non-empty key set
+ * and every mapped value must be finite. A variant that returns `{}`, silently
+ * drops a question, or emits `NaN`/`Infinity` must never look like a
  * zero-difference pass.
  */
 export function compareMetricKeys(baseline: Record<string, number>, variant: Record<string, number>): ParityKeyDiff {
@@ -52,5 +64,7 @@ export function compareMetricKeys(baseline: Record<string, number>, variant: Rec
     missingInBaseline.sort((a, b) => a.localeCompare(b));
     return { ok: false, reason: "ANSWER_KEY_MISMATCH", missing_in_variant: missingInVariant, missing_in_baseline: missingInBaseline };
   }
+  const nonFinite = nonFiniteMetricKeys(baseline, variant);
+  if (nonFinite.length > 0) return { ok: false, reason: "NON_FINITE_METRIC", non_finite_keys: nonFinite };
   return { ok: true };
 }

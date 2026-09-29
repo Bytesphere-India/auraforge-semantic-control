@@ -71,12 +71,18 @@ async function main(): Promise<void> {
           reason: keys.reason,
           missing_in_variant: keys.missing_in_variant,
           missing_in_baseline: keys.missing_in_baseline,
+          non_finite_keys: keys.non_finite_keys,
         });
       }
       let caseMax = 0;
       let caseKey: string | null = null;
       for (const key of Object.keys(baselineMetrics)) {
         const delta = Math.abs((baselineMetrics[key] ?? 0) - (variantMetrics[key] ?? 0));
+        if (!Number.isFinite(delta)) {
+          // Belt and braces: compareMetricKeys already rejects non-finite values,
+          // but a NaN delta must never be silently folded into a 0-max case.
+          throw new ParityError({ ok: false, variant: variantDir, providers, fixture: fixture.name, reason: "NON_FINITE_METRIC", non_finite_keys: [key] });
+        }
         diffs[key] = delta;
         if (key.endsWith(".noul")) maxNoul = Math.max(maxNoul, delta);
         else if (key.includes(".p.")) maxProbability = Math.max(maxProbability, delta);

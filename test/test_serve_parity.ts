@@ -1,11 +1,11 @@
 /**
- * Fail-closed answer-parity tests (review finding: a variant that returns `{}`
- * or drops an answer key must never be reported as a zero-difference pass).
- * Pure: no model, no onnxruntime.
+ * Fail-closed answer-parity tests (review findings: a variant that returns `{}`,
+ * drops an answer key, or emits `NaN`/`Infinity` must never be reported as a
+ * zero-difference pass). Pure: no model, no onnxruntime.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compareMetricKeys, metrics } from "../scripts/parity.js";
+import { compareMetricKeys, metrics, nonFiniteMetricKeys } from "../scripts/parity.js";
 import type { Question, SystemOneResult } from "../src/types.js";
 
 test("compareMetricKeys accepts identical non-empty key sets", () => {
@@ -36,6 +36,38 @@ test("compareMetricKeys fails closed on a dropped or extra key", () => {
   const extra = compareMetricKeys({ "a.noul": 0.1 }, { "a.noul": 0.1, "b.noul": 0.2 });
   assert.equal(extra.ok, false);
   assert.deepEqual(extra.missing_in_baseline, ["b.noul"]);
+});
+
+test("compareMetricKeys fails closed on NaN or infinite variant metrics", () => {
+  const nan = compareMetricKeys({ "a.noul": 0.1 }, { "a.noul": Number.NaN });
+  assert.equal(nan.ok, false);
+  assert.equal(nan.reason, "NON_FINITE_METRIC");
+  assert.deepEqual(nan.non_finite_keys, ["a.noul"]);
+
+  const infinite = compareMetricKeys({ "a.noul": 0.1, "a.confidence": 0.2 }, { "a.noul": 0.1, "a.confidence": Number.POSITIVE_INFINITY });
+  assert.equal(infinite.ok, false);
+  assert.deepEqual(infinite.non_finite_keys, ["a.confidence"]);
+});
+
+test("compareMetricKeys fails closed on a non-finite baseline metric", () => {
+  const diff = compareMetricKeys({ "a.noul": Number.NaN }, { "a.noul": 0.1 });
+  assert.equal(diff.ok, false);
+  assert.equal(diff.reason, "NON_FINITE_METRIC");
+});
+
+test("nonFiniteMetricKeys reports every offending key once, sorted", () => {
+  const keys = nonFiniteMetricKeys({ "b.noul": 0.1, "a.noul": Number.NaN }, { "b.noul": Number.NEGATIVE_INFINITY, "a.noul": 0.2 });
+  assert.deepEqual(keys, ["a.noul", "b.noul"]);
+  assert.deepEqual(nonFiniteMetricKeys({ "a.noul": 0.1 }, { "a.noul": 0.2 }), []);
+});
+
+test("metrics preserves a NaN so the comparison can reject it", () => {
+  const result: SystemOneResult<Record<string, Question>> = {
+    model: "laya",
+    usage: { input_tokens: 1, output_tokens: 0 },
+    answers: { n: { type: "noul", noul: Number.NaN, rl_agent: { act_probability: 1 } } },
+  };
+  assert.ok(Number.isNaN(metrics(result)["n.noul"]));
 });
 
 test("metrics flattens noul, choice and score answers", () => {

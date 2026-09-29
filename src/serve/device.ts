@@ -167,23 +167,41 @@ export function isFp32ModelDir(modelDir: string): boolean {
   return path.basename(path.resolve(modelDir)).toLowerCase().includes("fp32");
 }
 
-/** Size of `laya.onnx.data`, or null when it cannot be read. */
+/**
+ * Total weight bytes for a bundle: `laya.onnx` plus `laya.onnx.data` when
+ * present, or null when neither file can be read.
+ *
+ * The ONNX export stores weights externally (`laya.onnx.data`), but a single-file
+ * model embeds them in `laya.onnx`; measuring only the `.data` file would report
+ * 3.8 MB for a full 1.6 GB fp32 graph and let it onto the GPU.
+ */
 export function weightsByteLength(modelDir: string): number | null {
-  try {
-    return statSync(path.join(modelDir, "laya.onnx.data")).size;
-  } catch {
-    return null;
+  let total = 0;
+  let found = false;
+  for (const file of ["laya.onnx", "laya.onnx.data"]) {
+    try {
+      total += statSync(path.join(modelDir, file)).size;
+      found = true;
+    } catch {
+      // absent (or unreadable): the other file may still be measurable
+    }
   }
+  return found ? total : null;
 }
 
 /**
  * The reason a bundle may not run on the GPU under the 2048 MiB ceiling, or null
- * when it may. fp32 is always refused (≈2337 MiB measured before inference) and
- * an oversized weights file is refused regardless of its directory name.
+ * when it may.
+ *
+ * Fails closed: fp32 is always refused (≈2337 MiB measured before inference), an
+ * oversized weight total is refused regardless of its directory name, and a
+ * bundle whose weight size cannot be verified at all is refused too (an
+ * unverifiable model must never be assumed small).
  */
 export function gpuCeilingViolation(modelDir: string, weightsBytes: number | null): string | null {
   if (isFp32ModelDir(modelDir)) return `model directory ${path.basename(path.resolve(modelDir))} is the unquantized fp32 bundle`;
-  if (weightsBytes !== null && weightsBytes > MAX_GPU_WEIGHTS_BYTES) {
+  if (weightsBytes === null) return `weight size could not be verified under ${path.resolve(modelDir)}`;
+  if (weightsBytes > MAX_GPU_WEIGHTS_BYTES) {
     return `weights are ${weightsBytes} bytes, over the ${MAX_GPU_WEIGHTS_BYTES}-byte GPU budget`;
   }
   return null;
@@ -312,17 +330,32 @@ export function tinyModelPath(): string {
 }
 
 /**
- * Try to open a session on a 95-byte Relu fixture with the exact provider stack
- * that will be used for the real model. Returns `{ available: false, reason }`
+ * The providers a probe must use: GPU entries only.
+ *
+ * The real session keeps `"cpu"` last for per-node fallback, but including it in
+ * the probe would let ONNX Runtime satisfy the probe entirely on CPU after a GPU
+ * provider failed to initialize — masking the failure and producing a false
+ * `cuda` identity. When the list is CPU-only (already decided CPU), it is kept.
+ */
+export function gpuOnlyProviders(providers: ort.InferenceSession.ExecutionProviderConfig[]): ort.InferenceSession.ExecutionProviderConfig[] {
+  const gpu = providers.filter((provider) => providerName(provider) !== "cpu");
+  return gpu.length > 0 ? gpu : providers;
+}
+
+/**
+ * Try to open a session on a 95-byte Relu fixture with the exact GPU provider
+ * stack that will be used for the real model (the `"cpu"` fallback entry is
+ * dropped, see `gpuOnlyProviders`). Returns `{ available: false, reason }`
  * instead of throwing when the provider library is missing or the device cannot
  * be initialized, so identity never claims `cuda` for a stack that cannot run.
  */
 export async function probeProviders(providers: ort.InferenceSession.ExecutionProviderConfig[]): Promise<ProbeResult> {
   const fixture = tinyModelPath();
   if (!existsSync(fixture)) return { available: false, reason: `probe fixture missing: ${fixture}` };
+  const probed = gpuOnlyProviders(providers);
   let session: ort.InferenceSession | null = null;
   try {
-    session = await ort.InferenceSession.create(fixture, { executionProviders: providers, graphOptimizationLevel: "all" });
+    session = await ort.InferenceSession.create(fixture, { executionProviders: probed, graphOptimizationLevel: "all" });
     await session.run({ input: new ort.Tensor("float32", Float32Array.from([-1, 2, -3, 4]), [1, 4]) });
     return { available: true, reason: null };
   } catch (error) {

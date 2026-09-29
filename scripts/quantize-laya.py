@@ -357,9 +357,31 @@ def build_variant(args: argparse.Namespace, mode: str, variant_dir: Path, calib:
     }
     if ok and not args.no_parity:
         log(f"checking answer parity for {mode}")
-        manifest["parity"] = run_parity(src, variant_dir)
+        parity = run_parity(src, variant_dir)
+        manifest["parity"] = parity
+        if not parity.get("ok", False):
+            # A variant that cannot load with the required EP, or fails answer
+            # parity, is not "ok" and must not stop the fallback chain.
+            manifest["status"] = "failed"
+            manifest["reason"] = f"parity failed: {parity.get('reason') or parity.get('attempted_providers') or 'unknown'}"
     write_manifest(variant_dir, manifest)
     return manifest
+
+
+def fallback_order(variant: str, nvfp4_ok: bool) -> list[str]:
+    """Which variants to attempt after NVFP4, in order.
+
+    ``auto`` is a fallback chain: fp8 first, fp16 only if it does not clear both
+    gates. An explicit ``--variant`` builds exactly that one (or, for nvfp4,
+    nothing more).
+    """
+    if variant == "base-nvfp4":
+        return []
+    if variant != "auto":
+        return [variant]
+    if nvfp4_ok:
+        return []
+    return ["base-fp8", "base-fp16"]
 
 
 def main() -> int:
@@ -384,15 +406,22 @@ def main() -> int:
     # but it cannot succeed through ONNX PTQ today.
     if args.variant in ("auto", "base-nvfp4"):
         results["base-nvfp4"] = build_variant(args, "base-nvfp4", out_root / "base-nvfp4", calib)
-    if args.variant == "auto":
-        order = ["base-fp8", "base-fp16"]
-    else:
-        order = [] if args.variant == "base-nvfp4" else [args.variant]
 
+    nvfp4_ok = results.get("base-nvfp4", {}).get("status") == "ok"
+    order = fallback_order(args.variant, nvfp4_ok)
+
+    # Fallback chain: stop at the first variant whose quantization *and* parity
+    # passed; only fall through to fp16 when fp8 did not clear both gates.
+    stopped_after: str | None = None
     for mode in order:
-        if results.get(mode, {}).get("status") == "ok":
-            continue
         results[mode] = build_variant(args, mode, out_root / mode, calib)
+        if results[mode].get("status") == "ok":
+            stopped_after = mode
+            break
+    for mode in VARIANTS:
+        if mode not in results:
+            reason = f"not needed: {stopped_after} passed" if stopped_after else "not attempted"
+            results[mode] = {"status": "skipped", "reason": reason}
 
     summary = {
         "source": str(args.src.resolve()),
@@ -400,6 +429,7 @@ def main() -> int:
         "calibration_fixtures": samples,
         "variants": results,
         "preferred_order": list(VARIANTS),
+        "fallback_stopped_after": stopped_after,
     }
     (out_root / "quantization-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf8")
     print(json.dumps(summary, indent=2))

@@ -6,11 +6,15 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { Laya, LayaOptions } from "../src/laya.js";
 import {
   buildExecutionProviders,
   buildSessionOptions,
   gpuCeilingViolation,
+  gpuOnlyProviders,
   isFp32ModelDir,
   isGpuAttempt,
   loadDeviceConfig,
@@ -20,6 +24,7 @@ import {
   probeProviders,
   providerName,
   warmupEngine,
+  weightsByteLength,
   type DeviceConfig,
 } from "../src/serve/device.js";
 
@@ -108,13 +113,36 @@ test("LAYA_SERVE_DEVICE=cpu wins over a GPU LAYA_SERVE_PROVIDERS list", () => {
   assert.equal(isGpuAttempt(buildExecutionProviders(handBuilt)), false);
 });
 
-test("gpuCeilingViolation refuses the fp32 bundle and oversized weights", () => {
+test("gpuCeilingViolation fails closed on fp32, oversized and unverifiable bundles", () => {
   assert.equal(isFp32ModelDir("/opt/auraforge/models/laya/base-fp32"), true);
   assert.equal(isFp32ModelDir("/models/laya/base-fp16"), false);
   assert.match(gpuCeilingViolation("/opt/auraforge/models/laya/base-fp32", null) ?? "", /fp32/);
   assert.match(gpuCeilingViolation("/models/laya/base-fp16", MAX_GPU_WEIGHTS_BYTES + 1) ?? "", /over the .* GPU budget/);
   assert.equal(gpuCeilingViolation("/models/laya/base-fp16", 800_000_000), null);
-  assert.equal(gpuCeilingViolation("/models/laya/base-fp16", null), null);
+  // Unknown size must not be assumed small.
+  assert.match(gpuCeilingViolation("/models/laya/base-fp16", null) ?? "", /could not be verified/);
+});
+
+test("weightsByteLength measures embedded and external weights, or reports null", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "laya-weights-"));
+  try {
+    assert.equal(weightsByteLength(dir), null, "an empty directory has no verifiable weights");
+    await writeFile(path.join(dir, "laya.onnx"), Buffer.alloc(100, 1));
+    assert.equal(weightsByteLength(dir), 100, "a single-file model embeds its weights in laya.onnx");
+    await writeFile(path.join(dir, "laya.onnx.data"), Buffer.alloc(250, 2));
+    assert.equal(weightsByteLength(dir), 350, "external data adds to the graph size");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("gpuOnlyProviders drops the cpu fallback so a GPU probe cannot be satisfied on CPU", () => {
+  const cuda = buildExecutionProviders(loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }));
+  assert.deepEqual(gpuOnlyProviders(cuda).map(providerName), ["cuda"]);
+  const tensorrt = buildExecutionProviders(loadDeviceConfig({ LAYA_SERVE_PROVIDERS: "tensorrt,cuda,cpu" }));
+  assert.deepEqual(gpuOnlyProviders(tensorrt).map(providerName), ["tensorrt", "cuda"]);
+  // A CPU-only stack is left intact (it is already an explicit CPU decision).
+  assert.deepEqual(gpuOnlyProviders(["cpu"]), ["cpu"]);
 });
 
 test("loadEngine forces the fp32 default bundle to cpu before any GPU attempt", async () => {
@@ -187,14 +215,35 @@ test("buildSessionOptions always optimizes the graph and passes CPU threads only
   assert.equal(threaded.interOpNumThreads, 2);
 });
 
+test("loadEngine refuses the GPU when the weight size cannot be verified", async () => {
+  const calls: string[][] = [];
+  let probes = 0;
+  const outcome = await loadEngine({
+    modelDir: "/models/laya/candidate",
+    cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
+    load: collectLoader(calls),
+    probe: async () => {
+      probes += 1;
+      return { available: true, reason: null };
+    },
+    weightsBytes: () => null,
+    log: () => undefined,
+  });
+  assert.equal(outcome.device, "cpu");
+  assert.deepEqual(calls, [["cpu"]]);
+  assert.equal(probes, 0);
+  assert.match(outcome.ceiling?.reason ?? "", /could not be verified/);
+});
+
 test("loadEngine falls back from cuda to cpu and logs the probe reason", async () => {
   const calls: string[][] = [];
   const logs: string[] = [];
   const outcome = await loadEngine({
-    modelDir: "/does/not/exist",
+    modelDir: "/models/laya/base-fp16",
     cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
     load: collectLoader(calls),
     probe: async () => ({ available: false, reason: "CUDA failure: no device\nsecond line" }),
+    weightsBytes: () => 800_000_000,
     log: (message) => logs.push(message),
   });
   assert.equal(outcome.device, "cpu");
@@ -224,10 +273,11 @@ test("loadEngine never claims cuda when the GPU probe fails, even if the loader 
 test("loadEngine uses cuda directly when the probe verifies the provider stack", async () => {
   const calls: string[][] = [];
   const outcome = await loadEngine({
-    modelDir: "/does/not/exist",
+    modelDir: "/models/laya/base-fp16",
     cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
     load: collectLoader(calls),
     probe: async () => ({ available: true, reason: null }),
+    weightsBytes: () => 800_000_000,
     log: () => undefined,
   });
   assert.equal(outcome.device, "cuda");
@@ -295,6 +345,19 @@ test("probeProviders verifies the cpu stack on the tiny fixture (offline)", asyn
   const result = await probeProviders(["cpu"]);
   assert.equal(result.available, true);
   assert.equal(result.reason, null);
+});
+
+test("probeProviders does not let the cpu entry mask a GPU initialization failure", async (t) => {
+  const providers = buildExecutionProviders(loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }));
+  const result = await probeProviders(providers);
+  if (result.available) {
+    t.skip("CUDA is present; the masking case cannot be exercised on this host");
+    return;
+  }
+  // With the cpu fallback stripped, a GPU-less host must report unavailable
+  // rather than a false success on CPU.
+  assert.equal(result.available, false);
+  assert.ok(result.reason);
 });
 
 test("probeCuda opens a GPU session when CUDA is present, else skips", async (t) => {
