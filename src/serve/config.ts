@@ -88,7 +88,11 @@ export function deriveModelId(modelDir: string): string {
 const JEV_BLOCKED_HOSTNAMES = new Set(["metadata.google.internal", "metadata.goog"]);
 
 function unbracket(hostname: string): string {
-  return hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  // strip the IPv6 brackets and any trailing root dots (`localhost.` -> `localhost`)
+  return hostname
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "")
+    .toLowerCase();
 }
 
 /**
@@ -148,6 +152,7 @@ function isBlockedJevHost(hostname: string): boolean {
   if (host === "::") return true; // IPv6 unspecified
   if (/^fe[89ab]/.test(host)) return true; // fe80::/10 link-local
   if (host.startsWith("fc") || host.startsWith("fd")) return true; // fc00::/7 unique-local
+  if (host.startsWith("ff")) return true; // ff00::/8 multicast
   return false;
 }
 

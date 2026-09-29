@@ -163,7 +163,9 @@ Jev to Laya without changing anything but the URL:
    the configured Jev upstream and returns the upstream status, `content-type`
    and body unchanged and immediately. The only header it adds is the host-side
    `Authorization`; a caller-supplied one is never forwarded. Callers send no
-   key. The caller id comes from the `X-Caller` request header.
+   key. The caller id comes from the `X-Caller` request header. Redirects are
+   **not followed** (`redirect: "manual"`), so a 3xx `Location` cannot point the
+   tap at loopback or cloud metadata.
 2. **Shadow after the reply.** Dispatch is a handoff: the server commits it only
    from the response `finish`/`close` event, so the shadow is scheduled strictly
    after the response is on the wire (and `drain()` can see the in-flight handoff
@@ -189,7 +191,9 @@ Jev to Laya without changing anything but the URL:
    all-alphabetic ones) and `authorization:`/`api_key=` assignments, including in
    a non-JSON body and when the key is quoted (`{"api_key": "..."}`), consuming a
    whole quoted value so embedded commas/braces/escapes cannot leave a suffix; the
-   `X-Caller` value is scrubbed the same way. Only the media
+   `X-Caller` value is scrubbed the same way, and an object _key_ that is a
+   credential (a sensitive name, the host key itself, or an auth-header string)
+   is dropped rather than persisted. Only the media
    type of a `Content-Type` is persisted (`application/json`, never its
    parameters). Prototype-polluting keys (`__proto__`, `constructor`,
    `prototype`) are ignored and storage uses null-prototype objects.
@@ -220,8 +224,10 @@ The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 
 The upstream must be a valid `http(s)` URL without embedded credentials. Loopback
 is rejected unless `LAYA_SERVE_JEV_ALLOW_LOOPBACK=1`, and link-local/metadata/
-reserved ranges (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`,
-`metadata.google.internal`, ...) are always rejected at startup. IPv4-mapped and
+reserved ranges (`169.254.0.0/16`, `fe80::/10`, `ff00::/8`, `fd00:ec2::254`,
+`metadata.google.internal`, ...) are always rejected at startup. Hostnames are
+normalized (trailing root dots and case are stripped) before matching, so
+`localhost.`/`metadata.google.internal.` cannot bypass the gates. IPv4-mapped and
 IPv4-compatible IPv6 literals (`::ffff:169.254.169.254`, `::ffff:127.0.0.1`,
 `::7f00:1`, and their normalized hex forms) are decoded and classified as the
 IPv4 address they represent, so they cannot bypass these checks.

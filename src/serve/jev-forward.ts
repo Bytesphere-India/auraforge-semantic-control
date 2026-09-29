@@ -65,6 +65,9 @@ export const fetchJevTransport: JevTransport = async (input) => {
       method: "POST",
       headers,
       body: input.body,
+      // never follow a redirect: a 3xx `Location` could point at loopback or
+      // cloud metadata and would bypass the startup address-class gate
+      redirect: "manual",
       signal: AbortSignal.timeout(input.timeoutMs),
     });
     const body = await response.text();

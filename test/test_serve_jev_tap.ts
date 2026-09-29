@@ -688,9 +688,72 @@ test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", (
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(mapped("7f00:1"))}/x` }), /loopback/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(compat("7f00:1"))}/x` }), /loopback/);
 
+  // trailing root dots (FQDN form) must not bypass the gates
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("localhost.")}/x` }), /loopback/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("sub.localhost.")}/x` }), /loopback/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("metadata.google.internal.")}/x` }), /blocked/);
+
+  // IPv6 multicast (ff00::/8) must be blocked
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("[ff02::1]")}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("[ff00::1]")}/x` }), /blocked/);
+
   const loopback = `${httpUrl("127.0.0.1:9000")}/x`;
   const allowed = loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: loopback, LAYA_SERVE_JEV_ALLOW_LOOPBACK: "1" });
   assert.equal(allowed.jev.upstreamUrl, loopback);
   const publicUrl = loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: "https://openrouter.ai/api/alpha/decisions" });
   assert.equal(publicUrl.jev.upstreamUrl, "https://openrouter.ai/api/alpha/decisions");
+});
+
+test("the forward transport does not follow upstream redirects", async () => {
+  let hits = 0;
+  const target = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ leaked: true }));
+  });
+  await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+  const targetPort = (target.address() as AddressInfo).port;
+
+  const redirector = http.createServer((_req, res) => {
+    res.writeHead(302, { location: `http://127.0.0.1:${targetPort}/latest/meta-data/` });
+    res.end("redirecting");
+  });
+  await new Promise<void>((resolve) => redirector.listen(0, "127.0.0.1", resolve));
+  const redirectorPort = (redirector.address() as AddressInfo).port;
+
+  try {
+    const result = await fetchJevTransport({
+      url: `http://127.0.0.1:${redirectorPort}/api/alpha/decisions`,
+      body: "{}",
+      contentType: "application/json",
+      apiKey: TAP_KEY,
+      timeoutMs: 5000,
+    });
+    assert.equal(result.status, 302, "the redirect must be returned, not followed");
+    assert.equal(hits, 0, "the redirect target must never be fetched");
+  } finally {
+    await new Promise<void>((resolve) => redirector.close(() => resolve()));
+    await new Promise<void>((resolve) => target.close(() => resolve()));
+  }
+});
+
+test("does not persist credentials smuggled as object keys", async () => {
+  const sanitized = sanitizeForStorage({ [TAP_KEY]: "v", "Authorization: Bearer caller-token-xyz": "v", safe: "ok" }, TAP_KEY) as Record<string, unknown>;
+  const text = JSON.stringify(sanitized);
+  assert.ok(!text.includes(TAP_KEY), "a key equal to the host secret must be dropped");
+  assert.ok(!text.includes("caller-token-xyz"), "an auth-header key must be dropped");
+  assert.equal(sanitized.safe, "ok");
+
+  const h = await setup();
+  try {
+    const payload = { ...basePayload(), [TAP_KEY]: "leak", state: { safe: "ok" } };
+    const res = await postTap(h, payload);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.ok(!(await readFile(h.pairsFile, "utf8")).includes(TAP_KEY), "the host secret must not appear even as a key");
+    assert.equal(rec(rec(record.request).state).safe, "ok");
+  } finally {
+    await h.close();
+  }
 });

@@ -91,7 +91,9 @@ export function sanitizeForStorage(value: unknown, secret: string | null, depth 
     const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
       if (UNSAFE_KEY.test(key) || SENSITIVE_KEY.test(key)) continue;
-      out[key] = sanitizeForStorage(item, secret, depth + 1);
+      // a credential can also be smuggled as the key name itself
+      if (secret !== null && secret.length > 0 && key.includes(secret)) continue;
+      out[redactSecret(key, secret)] = sanitizeForStorage(item, secret, depth + 1);
     }
     return out;
   }
