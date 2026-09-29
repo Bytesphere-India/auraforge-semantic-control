@@ -10,6 +10,12 @@
  *      (no short timeout) and appends one joined record to
  *      `jev-laya-pairs.jsonl` with the payload, Jev's reply and Laya's reply.
  *
+ * Everything that exists only to prepare the shadow (JSON decode, SHA-256,
+ * request validation and request-hash computation) runs *after* the response,
+ * inside `runShadow`, not on the forward path: the caller's Jev response has no
+ * added latency and can never be failed by shadow-prep. A prep failure is caught
+ * and recorded as `SHADOW_PREP_ERROR`.
+ *
  * Dispatch is a *handoff*: `handle()` returns the response plus a `commit()`
  * callback. The HTTP layer calls `commit()` only from the response `finish`/
  * `close` events, so the shadow is scheduled strictly after the response is on
@@ -80,19 +86,28 @@ export interface JevTapOptions {
   now?: () => number;
   clock?: () => Date;
   newId?: () => string;
+  /** shadow-only: decode/validate a body; injectable so tests can prove it can never fail the forward */
+  validateRequest?: typeof validateDecisionRequest;
+  /** shadow-only: compute the canonical request hash; injectable for the same reason */
+  hashRequest?: typeof computeRequestHash;
 }
 
+/** Only what the outbound forward needs — no shadow-prep work runs before the response. */
 interface ShadowArgs {
   requestId: string;
   receivedAt: string;
   caller: string | null;
   contentType: string;
   body: string;
+  forward: JevForwardResult;
+}
+
+/** Shadow-only decode/validate/hash, computed post-response inside `runShadow`. */
+interface ShadowPrep {
   parsed: unknown;
   payloadSha: string;
   requestHash: string;
   validation: ValidationResult | null;
-  forward: JevForwardResult;
 }
 
 function parseJson(text: string): unknown {
@@ -140,6 +155,8 @@ export function createJevTap(options: JevTapOptions): JevTap {
   const newId = options.newId ?? (() => randomUUID());
   const queueMax = options.queueMax ?? 256;
   const queue = new SerialQueue(queueMax);
+  const validateRequest = options.validateRequest ?? validateDecisionRequest;
+  const hashRequest = options.hashRequest ?? computeRequestHash;
   const counters = { calls: 0, forwarded_ok: 0, forwarded_error: 0, shadows_ok: 0, shadows_error: 0, last_error: null as string | null };
 
   // In-flight handoffs between `handle()` returning and `commit()` being called.
@@ -158,7 +175,22 @@ export function createJevTap(options: JevTapOptions): JevTap {
   };
   const waitForHandoffs = (): Promise<void> => (handoffs === 0 ? Promise.resolve() : new Promise<void>((resolve) => handoffWaiters.push(resolve)));
 
-  const writePair = (args: ShadowArgs, laya: JevLayaPairLaya): void => {
+  /** Shadow-only prep. Never called on the forward path; may throw, and the caller of this must isolate it. */
+  const prepareShadow = (body: string): ShadowPrep => {
+    const parsed = parseJson(body);
+    const payloadSha = sha256(body);
+    const validation = parsed === undefined ? null : validateRequest(parsed, options.limits);
+    const requestHash = validation !== null && validation.ok ? hashRequest(options.identity, validation.state, validation.questions) : payloadSha;
+    return { parsed, payloadSha, requestHash, validation };
+  };
+
+  /** A record can always be written even if `prepareShadow` throws. */
+  const fallbackPrep = (body: string): ShadowPrep => {
+    const payloadSha = sha256(body);
+    return { parsed: undefined, payloadSha, requestHash: payloadSha, validation: null };
+  };
+
+  const writePair = (args: ShadowArgs, prep: ShadowPrep, laya: JevLayaPairLaya): void => {
     const replyParsed = parseJson(args.forward.body);
     const replyRecord = asRecord(replyParsed);
     const usage = replyRecord && "usage" in replyRecord ? sanitizeForStorage(replyRecord.usage, options.apiKey) : null;
@@ -169,9 +201,9 @@ export function createJevTap(options: JevTapOptions): JevTap {
       received_at: args.receivedAt,
       request_id: args.requestId,
       caller: args.caller === null ? null : redactSecret(args.caller, options.apiKey),
-      request_hash: args.requestHash,
-      payload_sha256: args.payloadSha,
-      request: args.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(args.parsed, options.apiKey),
+      request_hash: prep.requestHash,
+      payload_sha256: prep.payloadSha,
+      request: prep.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(prep.parsed, options.apiKey),
       forwarded: { url: upstreamUrl, content_type: mediaType(args.contentType) },
       jev: {
         status: args.forward.status,
@@ -200,35 +232,44 @@ export function createJevTap(options: JevTapOptions): JevTap {
     error,
   });
 
+  const failShadow = (args: ShadowArgs, prep: ShadowPrep, started: number, code: string): void => {
+    counters.shadows_error += 1;
+    counters.last_error = code;
+    writePair(args, prep, errorLaya(started, code));
+  };
+
   const runShadow = async (args: ShadowArgs): Promise<void> => {
     const started = now();
-    if (args.forward.error === "JEV_KEY_MISSING") {
-      // Fail closed: the call was refused, so Laya must not run either.
-      counters.shadows_error += 1;
-      counters.last_error = "JEV_KEY_MISSING";
-      writePair(args, errorLaya(started, "JEV_KEY_MISSING"));
-      return;
-    }
-    if (args.validation === null) {
-      counters.shadows_error += 1;
-      counters.last_error = "INVALID_JSON";
-      writePair(args, errorLaya(started, "INVALID_JSON"));
-      return;
-    }
-    if (!args.validation.ok) {
-      counters.shadows_error += 1;
-      counters.last_error = args.validation.code;
-      writePair(args, errorLaya(started, args.validation.code));
+    let prep: ShadowPrep;
+    try {
+      prep = prepareShadow(args.body);
+    } catch {
+      // Shadow prep can never fail the (already written) Jev response.
+      failShadow(args, fallbackPrep(args.body), started, "SHADOW_PREP_ERROR");
       return;
     }
 
-    const { state, questions } = args.validation;
+    if (args.forward.error === "JEV_KEY_MISSING") {
+      // Fail closed: the call was refused, so Laya must not run either.
+      failShadow(args, prep, started, "JEV_KEY_MISSING");
+      return;
+    }
+    if (prep.validation === null) {
+      failShadow(args, prep, started, "INVALID_JSON");
+      return;
+    }
+    if (!prep.validation.ok) {
+      failShadow(args, prep, started, prep.validation.code);
+      return;
+    }
+
+    const { state, questions } = prep.validation;
     try {
       const result = await options.engine.systemOne(state, questions);
       const latencyMs = Math.max(0, now() - started);
       recordShadowAnswers(options.shadow, options.identity, {
         requestId: args.requestId,
-        requestHash: args.requestHash,
+        requestHash: prep.requestHash,
         questions,
         answers: result.answers,
         latencyMs,
@@ -236,7 +277,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
         error: "MISSING_ANSWER",
       });
       counters.shadows_ok += 1;
-      writePair(args, {
+      writePair(args, prep, {
         status: "ok",
         latency_ms: Math.round(latencyMs),
         model: options.identity.model,
@@ -249,16 +290,14 @@ export function createJevTap(options: JevTapOptions): JevTap {
       const latencyMs = Math.max(0, now() - started);
       recordShadowAnswers(options.shadow, options.identity, {
         requestId: args.requestId,
-        requestHash: args.requestHash,
+        requestHash: prep.requestHash,
         questions,
         answers: null,
         latencyMs,
         inputTokens: 0,
         error: "ENGINE_ERROR",
       });
-      counters.shadows_error += 1;
-      counters.last_error = "ENGINE_ERROR";
-      writePair(args, errorLaya(started, "ENGINE_ERROR"));
+      failShadow(args, prep, started, "ENGINE_ERROR");
     }
   };
 
@@ -269,9 +308,13 @@ export function createJevTap(options: JevTapOptions): JevTap {
       if (committed) return;
       committed = true;
       if (!queue.push(() => runShadow(args))) {
-        counters.shadows_error += 1;
-        counters.last_error = "QUEUE_FULL";
-        writePair(args, errorLaya(now(), "QUEUE_FULL"));
+        let prep: ShadowPrep;
+        try {
+          prep = prepareShadow(args.body);
+        } catch {
+          prep = fallbackPrep(args.body);
+        }
+        failShadow(args, prep, now(), "QUEUE_FULL");
       }
       handoffDone();
     };
@@ -280,23 +323,14 @@ export function createJevTap(options: JevTapOptions): JevTap {
 
   const handle = async (body: string, caller: string | null, contentType: string): Promise<TapHandoff> => {
     counters.calls += 1;
-    const requestId = newId();
-    const receivedAt = clock().toISOString();
-    const parsed = parseJson(body);
-    const payloadSha = sha256(body);
-    const validation = parsed === undefined ? null : validateDecisionRequest(parsed, options.limits);
-    const requestHash = validation !== null && validation.ok ? computeRequestHash(options.identity, validation.state, validation.questions) : payloadSha;
-    const effectiveContentType = contentType || "application/json";
+    // Forward-path only: nothing here decodes, hashes, validates or hashes the
+    // body, so shadow prep cannot add latency to or fail the Jev response.
     const args: ShadowArgs = {
-      requestId,
-      receivedAt,
+      requestId: newId(),
+      receivedAt: clock().toISOString(),
       caller,
-      contentType: effectiveContentType,
+      contentType: contentType || "application/json",
       body,
-      parsed,
-      payloadSha,
-      requestHash,
-      validation,
       forward: keyMissingForward(),
     };
 
@@ -309,7 +343,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
     args.forward = await options.transport({
       url: upstreamUrl,
       body,
-      contentType: effectiveContentType,
+      contentType: args.contentType,
       apiKey: options.apiKey,
       timeoutMs: options.timeoutMs,
     });

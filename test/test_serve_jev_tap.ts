@@ -9,7 +9,7 @@ import { DEFAULT_LIMITS } from "../src/serve/protocol.js";
 import { loadServeConfig } from "../src/serve/config.js";
 import { fetchJevTransport, type JevForwardResult, type JevTransport } from "../src/serve/jev-forward.js";
 import { loadJevKey, redactSecret, sanitizeForStorage } from "../src/serve/jev-key.js";
-import { createJevTap, type JevTap } from "../src/serve/jev-tap.js";
+import { createJevTap, type JevTap, type JevTapOptions } from "../src/serve/jev-tap.js";
 import { createServer, type ServeConfig } from "../src/serve/server.js";
 import { JevLayaPairsLog, ShadowLog } from "../src/serve/shadow.js";
 import type { DecisionEngine, EngineIdentity } from "../src/serve/types.js";
@@ -152,6 +152,8 @@ interface SetupOptions {
   withTap?: boolean;
   upstreamStatus?: number;
   upstreamReply?: unknown;
+  validateRequest?: NonNullable<JevTapOptions["validateRequest"]>;
+  hashRequest?: NonNullable<JevTapOptions["hashRequest"]>;
 }
 
 interface Harness {
@@ -192,6 +194,8 @@ async function setup(options: SetupOptions = {}): Promise<Harness> {
           pairs,
           limits: DEFAULT_LIMITS,
           queueMax: options.queueMax ?? 256,
+          validateRequest: options.validateRequest,
+          hashRequest: options.hashRequest,
         });
 
   const config: ServeConfig = { host: "127.0.0.1", port: 0, maxBodyBytes: 1024 * 1024, limits: DEFAULT_LIMITS, startedAtMs: Date.now() };
@@ -407,6 +411,48 @@ test("a failing Laya never breaks the Jev response and is recorded as an error",
     const shadow = await h.shadowLines();
     assert.equal(shadow.length, Object.keys(basePayload().questions).length);
     assert.ok(shadow.every((line) => line.status === "error" && line.error === "ENGINE_ERROR"));
+  } finally {
+    await h.close();
+  }
+});
+
+test("a throwing shadow validator never fails the forwarded Jev response", async () => {
+  const h = await setup({
+    validateRequest: () => {
+      throw new Error("validator exploded");
+    },
+  });
+  try {
+    const res = await postTap(h, basePayload());
+    assert.equal(res.status, 200, "shadow prep must not affect the forwarded response");
+    assert.equal(h.upstream.calls.length, 1, "the upstream call must still happen");
+
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.equal(rec(record.jev).status, 200);
+    assert.equal(rec(record.jev).error, null);
+    assert.equal(rec(record.laya).status, "error");
+    assert.equal(rec(record.laya).error, "SHADOW_PREP_ERROR");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a throwing shadow hash never fails the forwarded Jev response", async () => {
+  const h = await setup({
+    hashRequest: () => {
+      throw new Error("hash exploded");
+    },
+  });
+  try {
+    const res = await postTap(h, basePayload());
+    assert.equal(res.status, 200, "shadow prep must not affect the forwarded response");
+    assert.equal(h.upstream.calls.length, 1, "the upstream call must still happen");
+
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.equal(rec(record.jev).status, 200);
+    assert.equal(rec(record.laya).error, "SHADOW_PREP_ERROR");
   } finally {
     await h.close();
   }

@@ -169,7 +169,11 @@ Jev to Laya without changing anything but the URL:
 2. **Shadow after the reply.** Dispatch is a handoff: the server commits it only
    from the response `finish`/`close` event, so the shadow is scheduled strictly
    after the response is on the wire (and `drain()` can see the in-flight handoff
-   during shutdown). The payload then runs through Laya on a serial queue (no
+   during shutdown). Everything that exists only to prepare the shadow — JSON
+   decode, SHA-256, request validation and request-hash computation — also runs
+   after the response, on the queue, not on the forward path, so prep can never
+   add latency to or fail the Jev response (a prep failure is recorded as
+   `SHADOW_PREP_ERROR`). The payload then runs through Laya on a serial queue (no
    short timeout; overflow is reported, not dropped). A slow or failing Laya can
    never delay or fail the Jev response.
 3. **One joined record per call** (`jev-laya-pairs.jsonl`): the full request
