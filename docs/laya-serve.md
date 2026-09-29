@@ -185,10 +185,12 @@ Jev to Laya without changing anything but the URL:
    `/health` exposes only a non-reversible fingerprint.
 5. **Credential scrubbing.** Credential-named fields (`authorization`,
    `api_key`, ...) are _dropped_ (not replaced) and string values are scrubbed of
-   `Bearer`/`Basic` tokens and `authorization:`/`api_key=` assignments, including
-   in a non-JSON body; the `X-Caller` value is scrubbed the same way.
-   Prototype-polluting keys (`__proto__`, `constructor`, `prototype`) are ignored
-   and storage uses null-prototype objects.
+   `Bearer`/`Basic` tokens (any scheme-prefixed token of 8+ characters, including
+   all-alphabetic ones) and `authorization:`/`api_key=` assignments, including in
+   a non-JSON body; the `X-Caller` value is scrubbed the same way. Only the media
+   type of a `Content-Type` is persisted (`application/json`, never its
+   parameters). Prototype-polluting keys (`__proto__`, `constructor`,
+   `prototype`) are ignored and storage uses null-prototype objects.
 
 The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 `503 JEV_TAP_DISABLED`).
@@ -217,7 +219,10 @@ The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 The upstream must be a valid `http(s)` URL without embedded credentials. Loopback
 is rejected unless `LAYA_SERVE_JEV_ALLOW_LOOPBACK=1`, and link-local/metadata/
 reserved ranges (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`,
-`metadata.google.internal`, ...) are always rejected at startup.
+`metadata.google.internal`, ...) are always rejected at startup. IPv4-mapped and
+IPv4-compatible IPv6 literals (`::ffff:169.254.169.254`, `::ffff:127.0.0.1`,
+`::7f00:1`, and their normalized hex forms) are decoded and classified as the
+IPv4 address they represent, so they cannot bypass these checks.
 
 ## Run
 

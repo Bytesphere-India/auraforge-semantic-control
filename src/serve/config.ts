@@ -91,9 +91,31 @@ function unbracket(hostname: string): string {
   return hostname.replace(/^\[|\]$/g, "").toLowerCase();
 }
 
-/** loopback: 127.0.0.0/8, ::1 and localhost. */
+/**
+ * Decode an IPv4 address embedded in IPv6 (`::ffff:a.b.c.d`, `::a.b.c.d`, or the
+ * normalized hex forms `::ffff:xxxx:xxxx`, `::xxxx:xxxx`) so mapped addresses
+ * cannot bypass the IPv4 class checks. Returns a dotted quad, or null when the
+ * host is not an embedded-IPv4 form.
+ */
+function ipv4FromEmbedded(host: string): string | null {
+  const match = /^::(?:ffff:)?([0-9a-f:.]+)$/i.exec(host);
+  if (!match) return null;
+  const rest = match[1] ?? "";
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(rest)) return rest;
+  const groups = rest.split(":");
+  if (groups.length === 2 && groups.every((group) => /^[0-9a-f]{1,4}$/i.test(group))) {
+    const hi = Number.parseInt(groups[0] ?? "0", 16);
+    const lo = Number.parseInt(groups[1] ?? "0", 16);
+    return [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join(".");
+  }
+  return null;
+}
+
+/** loopback: 127.0.0.0/8, ::1, IPv4-mapped loopback and localhost. */
 function isLoopbackHost(hostname: string): boolean {
   const host = unbracket(hostname);
+  const mapped = ipv4FromEmbedded(host);
+  if (mapped !== null) return /^127\./.test(mapped);
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (host === "::1") return true;
   return /^127\./.test(host);
@@ -102,12 +124,14 @@ function isLoopbackHost(hostname: string): boolean {
 /**
  * Address classes the tap must never forward to, so an operator mistake cannot
  * turn the tap into an SSRF primitive against cloud metadata or reserved space.
+ * IPv4-mapped IPv6 literals are decoded and checked as their IPv4 address.
  */
 function isBlockedJevHost(hostname: string): boolean {
   const host = unbracket(hostname);
   if (JEV_BLOCKED_HOSTNAMES.has(host)) return true;
 
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  const candidate = ipv4FromEmbedded(host) ?? host;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(candidate);
   if (v4) {
     const a = Number(v4[1]);
     const b = Number(v4[2]);

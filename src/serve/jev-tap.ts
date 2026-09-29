@@ -23,6 +23,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { redactSecret, sanitizeForStorage, secretFingerprint } from "./jev-key.js";
 import { parseJevUpstream, type JevForwardResult, type JevTransport } from "./jev-forward.js";
 import { computeRequestHash, validateDecisionRequest, type ServeLimits, type ValidationResult } from "./protocol.js";
+import { SerialQueue } from "./serial-queue.js";
 import { recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
 import type { DecisionEngine, EngineIdentity } from "./types.js";
 
@@ -94,37 +95,6 @@ interface ShadowArgs {
   forward: JevForwardResult;
 }
 
-/** Serial task queue: Laya shadows never overlap, and overflow is observable. */
-class SerialQueue {
-  private tail: Promise<void> = Promise.resolve();
-  private depth = 0;
-
-  constructor(private readonly max: number) {}
-
-  get pending(): number {
-    return this.depth;
-  }
-
-  /** returns false when the queue is full */
-  push(task: () => Promise<void>): boolean {
-    if (this.depth >= this.max) return false;
-    this.depth += 1;
-    this.tail = this.tail
-      .then(task)
-      .catch(() => {
-        // a task must never break the chain; task bodies handle their own errors
-      })
-      .finally(() => {
-        this.depth -= 1;
-      });
-    return true;
-  }
-
-  idle(): Promise<void> {
-    return this.tail;
-  }
-}
-
 function parseJson(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -139,6 +109,17 @@ function sha256(text: string): string {
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+/**
+ * Persist only the media type of a `content-type` value. MIME parameters are
+ * caller-controlled and can smuggle credentials (e.g.
+ * `application/json; api_key=...`), so they are dropped; anything that is not a
+ * clean `type/subtype` falls back to `application/json`.
+ */
+function mediaType(value: string): string {
+  const bare = (value.split(";")[0] ?? "").trim().toLowerCase();
+  return /^[-a-z0-9!#$&^_.+]+\/[-a-z0-9!#$&^_.+]+$/.test(bare) ? bare : "application/json";
 }
 
 /** Synthesized upstream view when the tap refuses to forward (no host key). */
@@ -191,11 +172,11 @@ export function createJevTap(options: JevTapOptions): JevTap {
       request_hash: args.requestHash,
       payload_sha256: args.payloadSha,
       request: args.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(args.parsed, options.apiKey),
-      forwarded: { url: upstreamUrl, content_type: args.contentType },
+      forwarded: { url: upstreamUrl, content_type: mediaType(args.contentType) },
       jev: {
         status: args.forward.status,
         ok: args.forward.error === null && args.forward.status >= 200 && args.forward.status < 300,
-        content_type: args.forward.contentType,
+        content_type: mediaType(args.forward.contentType),
         latency_ms: Math.max(0, Math.round(args.forward.latencyMs)),
         reply:
           args.forward.error === null && replyParsed !== undefined

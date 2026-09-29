@@ -50,9 +50,8 @@ export function secretFingerprint(secret: string): string {
  * Scrub a string for persistence: the host key is replaced, and generic
  * `Bearer`/`Basic` credentials plus `authorization:`/`api_key=` assignments are
  * redacted even when no host key is known, so a caller-supplied credential can
- * never reach a shadow record. The token branch requires a plausible credential
- * shape (length >= 8 and at least one digit/symbol) to avoid mangling ordinary
- * prose such as "basic authentication".
+ * never reach a shadow record. Any scheme-prefixed token of length >= 8 is
+ * redacted, including all-alphabetic tokens; this errs toward over-redaction.
  */
 export function redactSecret(text: string, secret: string | null): string {
   let out = text;
@@ -61,7 +60,7 @@ export function redactSecret(text: string, secret: string | null): string {
   if (/^\s*(?:bearer|basic)\s+\S+/i.test(out)) return "[REDACTED]";
   return (
     out
-      .replace(/\b(?:bearer|basic)\s+([-a-z0-9._~+/=]+)/gi, (match, token: string) => (token.length >= 8 && /[-0-9._~+/=]/.test(token) ? "[REDACTED]" : match))
+      .replace(/\b(?:bearer|basic)\s+([-a-z0-9._~+/=]+)/gi, (match, token: string) => (token.length >= 8 ? "[REDACTED]" : match))
       // header- and assignment-style credentials, including inside a non-JSON body
       .replace(/((?:authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret))\s*[:=]\s*[^\r\n,}]*/gi, "$1=[REDACTED]")
   );

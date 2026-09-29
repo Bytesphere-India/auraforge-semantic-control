@@ -8,7 +8,7 @@ import path from "node:path";
 import { DEFAULT_LIMITS } from "../src/serve/protocol.js";
 import { loadServeConfig } from "../src/serve/config.js";
 import { fetchJevTransport, type JevForwardResult, type JevTransport } from "../src/serve/jev-forward.js";
-import { loadJevKey, sanitizeForStorage } from "../src/serve/jev-key.js";
+import { loadJevKey, redactSecret, sanitizeForStorage } from "../src/serve/jev-key.js";
 import { createJevTap, type JevTap } from "../src/serve/jev-tap.js";
 import { createServer, type ServeConfig } from "../src/serve/server.js";
 import { JevLayaPairsLog, ShadowLog } from "../src/serve/shadow.js";
@@ -500,18 +500,41 @@ test("scrubs a caller credential from a non-JSON payload before persisting it", 
   }
 });
 
-test("scrubs a Bearer token embedded in a nested string value", async () => {
+test("scrubs embedded bearer tokens, including all-alphabetic ones", async () => {
+  const alphaToken = "SecretCallerTokenAlpha";
+  assert.ok(!redactSecret(`Authorization: Bearer ${alphaToken}`, null).includes(alphaToken));
+  assert.ok(!redactSecret(`token Bearer ${alphaToken} tail`, null).includes(alphaToken));
+
   const h = await setup();
   try {
-    const payload = { ...basePayload(), state: { evidence: `retry with token Bearer ${CALLER_KEY}` } };
+    const payload = { ...basePayload(), state: { evidence: `retry with token Bearer ${CALLER_KEY}; alt Bearer ${alphaToken}` } };
     const res = await postTap(h, payload);
     assert.equal(res.status, 200);
     const [record] = await h.waitForRecords(1);
     assert.ok(record);
-    const state = rec(rec(record.request).state);
-    assert.ok(!String(state.evidence).includes(CALLER_KEY), "an embedded token must be redacted");
+    const evidence = String(rec(rec(record.request).state).evidence);
+    assert.ok(!evidence.includes(CALLER_KEY), "an embedded token must be redacted");
+    assert.ok(!evidence.includes(alphaToken), "an all-alphabetic token must be redacted");
     const persisted = await readFile(h.pairsFile, "utf8");
     assert.ok(!persisted.includes(CALLER_KEY));
+    assert.ok(!persisted.includes(alphaToken));
+  } finally {
+    await h.close();
+  }
+});
+
+test("does not persist credentials smuggled in the Content-Type header", async () => {
+  const contentTypeSecret = "caller-secret-99999";
+  const h = await setup();
+  try {
+    const res = await postTap(h, basePayload(), { "content-type": `application/json; api_key=${contentTypeSecret}` });
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.equal(rec(record.forwarded).content_type, "application/json");
+    assert.equal(rec(record.jev).content_type, "application/json");
+    const persisted = await readFile(h.pairsFile, "utf8");
+    assert.ok(!persisted.includes(contentTypeSecret), "a content-type credential must never be persisted");
   } finally {
     await h.close();
   }
@@ -609,6 +632,14 @@ test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", (
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("0.0.0.0:9000")}/x` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("metadata.google.internal")}/x` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("127.0.0.1:9000")}/x` }), /loopback/);
+
+  // IPv4-mapped / IPv4-compatible IPv6 literals must not bypass the IPv4 class checks
+  const mapped = (hex: string): string => `[::ffff:${hex}]`;
+  const compat = (hex: string): string => `[::${hex}]`;
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(mapped("a9fe:a9fe"))}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(mapped(linkLocal))}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(mapped("7f00:1"))}/x` }), /loopback/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(compat("7f00:1"))}/x` }), /loopback/);
 
   const loopback = `${httpUrl("127.0.0.1:9000")}/x`;
   const allowed = loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: loopback, LAYA_SERVE_JEV_ALLOW_LOOPBACK: "1" });
