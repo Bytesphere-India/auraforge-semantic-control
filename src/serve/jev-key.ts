@@ -46,6 +46,11 @@ export function secretFingerprint(secret: string): string {
   return createHash("sha256").update(secret).digest("hex").slice(0, 12);
 }
 
+const SENSITIVE_KEY = /(authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret)/i;
+
+/** Redact a `key[:=]value` assignment when the key names a credential. */
+const redactAssignment = (match: string, quote: string, key: string): string => (SENSITIVE_KEY.test(key) ? `${quote}${key}${quote}=[REDACTED]` : match);
+
 /**
  * Scrub a string for persistence: the host key is replaced, and generic
  * `Bearer`/`Basic` credentials plus `authorization:`/`api_key=` assignments are
@@ -62,12 +67,14 @@ export function redactSecret(text: string, secret: string | null): string {
     out
       .replace(/\b(?:bearer|basic)\s+([-a-z0-9._~+/=]+)/gi, (match, token: string) => (token.length >= 8 ? "[REDACTED]" : match))
       // header- and assignment-style credentials, including quoted JSON keys in
-      // an unparseable/non-JSON body (e.g. `{"api_key": "..."`)
-      .replace(/(["']?)((?:authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret))\1\s*[:=]\s*[^\r\n,}]*/gi, "$1$2$1=[REDACTED]")
+      // an unparseable/non-JSON body (e.g. `{"api_key": "..."`). Quoted values
+      // are consumed whole so an embedded `,`/`}` cannot leave a suffix behind.
+      .replace(/(["']?)([a-z_][\w-]*)\1\s*[:=]\s*"(?:[^"\\]|\\.)*"/gi, redactAssignment)
+      .replace(/(["']?)([a-z_][\w-]*)\1\s*[:=]\s*'(?:[^'\\]|\\.)*'/gi, redactAssignment)
+      .replace(/(["']?)([a-z_][\w-]*)\1\s*[:=]\s*[^\r\n,}]*/gi, redactAssignment)
   );
 }
 
-const SENSITIVE_KEY = /(authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret)/i;
 const UNSAFE_KEY = /^(?:__proto__|prototype|constructor)$/;
 
 /**

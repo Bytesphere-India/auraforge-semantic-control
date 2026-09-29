@@ -187,7 +187,8 @@ Jev to Laya without changing anything but the URL:
    `api_key`, ...) are _dropped_ (not replaced) and string values are scrubbed of
    `Bearer`/`Basic` tokens (any scheme-prefixed token of 8+ characters, including
    all-alphabetic ones) and `authorization:`/`api_key=` assignments, including in
-   a non-JSON body and when the key is quoted (`{"api_key": "..."}`); the
+   a non-JSON body and when the key is quoted (`{"api_key": "..."}`), consuming a
+   whole quoted value so embedded commas/braces/escapes cannot leave a suffix; the
    `X-Caller` value is scrubbed the same way. Only the media
    type of a `Content-Type` is persisted (`application/json`, never its
    parameters). Prototype-polluting keys (`__proto__`, `constructor`,

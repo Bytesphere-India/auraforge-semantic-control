@@ -520,6 +520,33 @@ test("scrubs quoted credential keys from an unparseable body", async () => {
   }
 });
 
+test("redacts a quoted credential value containing commas or braces", async () => {
+  const part = "secret_part";
+  const suffix = `${part}2`;
+  const cases = [
+    `{"api_key": "${part}1,${suffix}", invalid_json`,
+    `{"api_key": "${part}1}${suffix}", invalid_json`,
+    `{'access_token': '${part}1,${suffix}]', oops`,
+    `{"authorization": "Bearer ${part}1,${suffix}", invalid_json`,
+  ];
+  for (const body of cases) {
+    const scrubbed = redactSecret(body, null);
+    assert.ok(!scrubbed.includes(suffix), `redaction left a delimited suffix behind: ${scrubbed}`);
+  }
+
+  const h = await setup();
+  try {
+    const res = await postTap(h, `{"api_key": "${part}1,${suffix}", invalid_json`);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.ok(!String(record.request).includes(suffix), "an embedded suffix must not survive");
+    assert.ok(!(await readFile(h.pairsFile, "utf8")).includes(suffix));
+  } finally {
+    await h.close();
+  }
+});
+
 test("scrubs embedded bearer tokens, including all-alphabetic ones", async () => {
   const alphaToken = "SecretCallerTokenAlpha";
   assert.ok(!redactSecret(`Authorization: Bearer ${alphaToken}`, null).includes(alphaToken));
