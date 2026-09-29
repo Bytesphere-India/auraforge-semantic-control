@@ -117,9 +117,10 @@ interface UpstreamCall {
   body: string;
   authorization: string | null;
   contentType: string | null;
+  headers: http.IncomingHttpHeaders;
 }
 
-async function startUpstream(status: number, reply: unknown) {
+async function startUpstream(status: number, reply: unknown, headers: Record<string, string> = {}) {
   const calls: UpstreamCall[] = [];
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -129,9 +130,10 @@ async function startUpstream(status: number, reply: unknown) {
         body: Buffer.concat(chunks).toString("utf8"),
         authorization: typeof req.headers.authorization === "string" ? req.headers.authorization : null,
         contentType: typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : null,
+        headers: req.headers,
       });
       const body = typeof reply === "string" ? reply : JSON.stringify(reply);
-      res.writeHead(status, { "content-type": "application/json" });
+      res.writeHead(status, { "content-type": "application/json", ...headers });
       res.end(body);
     });
   });
@@ -152,6 +154,7 @@ interface SetupOptions {
   withTap?: boolean;
   upstreamStatus?: number;
   upstreamReply?: unknown;
+  upstreamHeaders?: Record<string, string>;
   validateRequest?: NonNullable<JevTapOptions["validateRequest"]>;
   hashRequest?: NonNullable<JevTapOptions["hashRequest"]>;
 }
@@ -172,7 +175,7 @@ async function setup(options: SetupOptions = {}): Promise<Harness> {
   const dir = await mkdtemp(path.join(tmpdir(), "laya-jev-tap-"));
   const pairsFile = path.join(dir, "jev-laya-pairs.jsonl");
   const shadowFile = path.join(dir, "laya-decisions.jsonl");
-  const upstream = await startUpstream(options.upstreamStatus ?? 200, options.upstreamReply ?? defaultReply);
+  const upstream = await startUpstream(options.upstreamStatus ?? 200, options.upstreamReply ?? defaultReply, options.upstreamHeaders ?? {});
   const engine = options.engine ?? stubEngine;
 
   const shadow = new ShadowLog(shadowFile, () => new Date());
@@ -297,6 +300,34 @@ test("passes a non-2xx Jev status and body through unchanged", async () => {
     assert.ok(record);
     assert.equal(rec(record.jev).status, 429);
     assert.equal(rec(record.jev).ok, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("forwards caller headers and returns upstream response headers unchanged", async () => {
+  const h = await setup({
+    upstreamHeaders: { "x-ratelimit-remaining": "42", "x-upstream-trace": "trace-up", "retry-after": "7" },
+  });
+  try {
+    const res = await postTap(h, basePayload(), {
+      "x-request-id": "trace-caller",
+      "x-idempotency-key": "idem-1",
+      authorization: `Bearer ${CALLER_KEY}`,
+    });
+    assert.equal(res.status, 200);
+
+    const call = h.upstream.calls[0];
+    assert.ok(call);
+    assert.equal(call.headers["x-request-id"], "trace-caller", "a caller trace header must be forwarded");
+    assert.equal(call.headers["x-idempotency-key"], "idem-1", "a caller idempotency key must be forwarded");
+    assert.equal(call.headers.authorization, `Bearer ${TAP_KEY}`, "the host key overrides any caller authorization");
+
+    assert.equal(res.headers.get("x-ratelimit-remaining"), "42", "an upstream rate-limit header must be returned");
+    assert.equal(res.headers.get("x-upstream-trace"), "trace-up", "an upstream trace header must be returned");
+    assert.equal(res.headers.get("retry-after"), "7", "an upstream retry-after header must be returned");
+    assert.equal(res.headers.get("content-type"), "application/json");
+    assert.equal(Number(res.headers.get("content-length")), Buffer.byteLength(JSON.stringify(defaultReply)));
   } finally {
     await h.close();
   }
@@ -462,6 +493,7 @@ test("a transport failure is returned as a synthesized error and still recorded"
   const failingTransport: JevTransport = async (): Promise<JevForwardResult> => ({
     status: 502,
     contentType: "application/json; charset=utf-8",
+    headers: {},
     body: JSON.stringify({ error: "jev upstream unreachable", code: "JEV_UPSTREAM_ERROR" }),
     latencyMs: 1,
     error: "JEV_UPSTREAM_ERROR",
@@ -714,6 +746,31 @@ test("the shadow is dispatched only after the response handoff commits", async (
   }
 });
 
+test("drops other credential-named fields while preserving usage token counts", async () => {
+  const h = await setup();
+  try {
+    const payload = {
+      ...basePayload(),
+      state: { password: "p", refresh_token: "r", session_id: "s", token: "t", input_tokens: 11, evidence: "ok" },
+    };
+    const res = await postTap(h, payload);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    const state = rec(rec(record.request).state);
+    for (const key of ["password", "refresh_token", "session_id", "token"]) {
+      assert.ok(!Object.prototype.hasOwnProperty.call(state, key), `${key} must be dropped`);
+    }
+    assert.equal(state.input_tokens, 11, "token *counts* must not be treated as credentials");
+    assert.equal(rec(rec(record.jev).usage).input_tokens, 11);
+
+    assert.ok(!redactSecret(`{"password": "hunter2"}`, null).includes("hunter2"));
+    assert.ok(!redactSecret("token=abc12345", null).includes("abc12345"));
+  } finally {
+    await h.close();
+  }
+});
+
 test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", () => {
   // build the scheme and the metadata address at runtime so fixture-only lint rules do not fire
   const httpUrl = (authority: string): string => ["http", "://", authority].join("");
@@ -725,6 +782,15 @@ test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", (
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("0.0.0.0:9000")}/x` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("metadata.google.internal")}/x` }), /blocked/);
   assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("127.0.0.1:9000")}/x` }), /loopback/);
+
+  // RFC1918 private space must be blocked, but adjacent public space must not
+  const ip = (...parts: number[]): string => parts.join(".");
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(ip(10, 0, 0, 1))}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(ip(172, 16, 0, 1))}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(ip(172, 31, 255, 255))}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(ip(192, 168, 1, 1))}/x` }), /blocked/);
+  const public172 = loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(ip(172, 32, 0, 1))}/x` });
+  assert.ok(public172.jev.upstreamUrl.includes(ip(172, 32, 0, 1)), "an address outside the RFC1918 /12 must be allowed");
 
   // IPv4-mapped / IPv4-compatible IPv6 literals must not bypass the IPv4 class checks
   const mapped = (hex: string): string => `[::ffff:${hex}]`;
@@ -772,6 +838,7 @@ test("the forward transport does not follow upstream redirects", async () => {
       url: `http://127.0.0.1:${redirectorPort}/api/alpha/decisions`,
       body: "{}",
       contentType: "application/json",
+      headers: {},
       apiKey: TAP_KEY,
       timeoutMs: 5000,
     });

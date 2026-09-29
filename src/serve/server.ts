@@ -197,7 +197,7 @@ export function createServer(deps: ServerDeps): http.Server {
 
     let forwarded: TapHandoff;
     try {
-      forwarded = await tap.handle(body.text, caller, contentType);
+      forwarded = await tap.handle(body.text, caller, contentType, req.headers);
     } catch {
       errors += 1;
       return sendError(res, 502, "JEV_TAP_ERROR", "the Jev shadow tap failed to forward the request");
@@ -208,7 +208,13 @@ export function createServer(deps: ServerDeps): http.Server {
     // idempotent, so registering both events is safe.
     res.once("finish", forwarded.commit);
     res.once("close", forwarded.commit);
-    res.writeHead(forwarded.status, { "content-type": forwarded.contentType, "content-length": Buffer.byteLength(forwarded.body) });
+    // Return the upstream headers unchanged; only content-type/content-length are
+    // re-derived from the body we actually hold.
+    res.writeHead(forwarded.status, {
+      ...forwarded.headers,
+      "content-type": forwarded.contentType,
+      "content-length": Buffer.byteLength(forwarded.body),
+    });
     res.end(forwarded.body);
   };
 

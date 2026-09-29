@@ -160,12 +160,15 @@ state, questions}`; the raw state/instructions are **never** written.
 Jev to Laya without changing anything but the URL:
 
 1. **Forward, unchanged.** The tap forwards the caller's body byte-for-byte to
-   the configured Jev upstream and returns the upstream status, `content-type`
-   and body unchanged and immediately. The only header it adds is the host-side
-   `Authorization`; a caller-supplied one is never forwarded. Callers send no
-   key. The caller id comes from the `X-Caller` request header. Redirects are
-   **not followed** (`redirect: "manual"`), so a 3xx `Location` cannot point the
-   tap at loopback or cloud metadata.
+   the configured Jev upstream and returns the upstream status, response headers
+   and body unchanged and immediately. Caller headers (trace ids, idempotency
+   keys, ...) are forwarded too, minus hop-by-hop and transport-controlled ones
+   (`host`, `content-length`, `accept-encoding`, ...); the only header the tap
+   adds is the host-side `Authorization`, and a caller-supplied `Authorization`
+   is never forwarded. Callers send no key. The caller id comes from the
+   `X-Caller` request header. Redirects are **not followed**
+   (`redirect: "manual"`), so a 3xx `Location` cannot point the tap at loopback
+   or cloud metadata.
 2. **Shadow after the reply.** Dispatch is a handoff: the server commits it only
    from the response `finish`/`close` event, so the shadow is scheduled strictly
    after the response is on the wire (and `drain()` can see the in-flight handoff
@@ -197,7 +200,10 @@ Jev to Laya without changing anything but the URL:
    whole quoted value so embedded commas/braces/escapes cannot leave a suffix; the
    `X-Caller` value is scrubbed the same way, and an object _key_ that is a
    credential (a sensitive name, the host key itself, or an auth-header string)
-   is dropped rather than persisted. Only the media
+   is dropped rather than persisted. Credential names include `authorization`,
+   `api_key`, `secret`, `password`, `passphrase`, `credential`, `cookie`,
+   `session`, and `token`/`refresh_token`/`id_token`; token _counts_
+   (`input_tokens`, `output_tokens`, ...) are not affected. Only the media
    type of a `Content-Type` is persisted (`application/json`, never its
    parameters). Prototype-polluting keys (`__proto__`, `constructor`,
    `prototype`) are ignored and storage uses null-prototype objects.
@@ -228,7 +234,8 @@ The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 
 The upstream must be a valid `http(s)` URL without embedded credentials. Loopback
 is rejected unless `LAYA_SERVE_JEV_ALLOW_LOOPBACK=1`, and link-local/metadata/
-reserved ranges (`169.254.0.0/16`, `fe80::/10`, `ff00::/8`, `fd00:ec2::254`,
+reserved ranges (`169.254.0.0/16`, RFC1918 `10.0.0.0/8`, `172.16.0.0/12`,
+`192.168.0.0/16`, `100.64.0.0/10`, `fe80::/10`, `ff00::/8`, `fd00:ec2::254`,
 `metadata.google.internal`, ...) are always rejected at startup. Hostnames are
 normalized (trailing root dots and case are stripped) before matching, so
 `localhost.`/`metadata.google.internal.` cannot bypass the gates. IPv4-mapped and

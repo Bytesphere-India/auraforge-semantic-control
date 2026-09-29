@@ -1,11 +1,10 @@
-"""Lane conformance entrypoint for the Jev shadow tap (Raja 2026-09-29).
+"""Polyglot conformance runner for the Jev shadow tap.
 
 The authoritative service tests are TypeScript (`tsx --test`, wired into
-`package.json` `"test"` per the brief).  This project has no Python tests, and the
-lane's evidence runner is `pytest` over changed `test_*.py` modules, so this
-single module is the lane's Python entrypoint: it runs the real TypeScript
-serve/tap suite exactly as `package.json` does and asserts a positive pass count
-with zero failures.  It does not reimplement or replace those tests.
+`package.json` `"test"` per the brief).  This module lets a pytest-based CI run
+the same impact-scoped serve/tap suite and asserts a positive pass count with
+zero failures, so the result is visible to whichever harness collected it.  It
+does not reimplement, replace or weaken the TypeScript tests.
 
 Fail-closed on every infrastructure problem: a missing `tsx`, a timeout, a
 non-zero exit, or a summary with no tests / no passes / any failure all fail the
@@ -22,8 +21,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TSX = REPO_ROOT / "node_modules" / ".bin" / "tsx"
 
-# The impact-scoped TypeScript modules this lane's `laya-serve` surface is
-# verified by; `test_serve_jev_tap.ts` is the brief's subject.
+# The impact-scoped TypeScript modules that verify the `laya-serve` surface;
+# `test_serve_jev_tap.ts` is the tap suite.
 SERVE_TEST_MODULES = (
     "test/test_serve_protocol.ts",
     "test/test_serve_shadow.ts",

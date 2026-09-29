@@ -46,10 +46,12 @@ export function secretFingerprint(secret: string): string {
   return createHash("sha256").update(secret).digest("hex").slice(0, 12);
 }
 
-const SENSITIVE_KEY = /(authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret)/i;
+const SENSITIVE_KEY = /(authorization|api[_-]?key|password|passwd|passphrase|credential|cookie|se(?:cret|ssion))/i;
+const SENSITIVE_TOKEN = /(?:^|[_-])token(?![a-z0-9_])/i;
+const isSensitiveKey = (key: string): boolean => SENSITIVE_KEY.test(key) || SENSITIVE_TOKEN.test(key);
 
 /** Redact a `key[:=]value` assignment when the key names a credential. */
-const redactAssignment = (match: string, quote: string, key: string): string => (SENSITIVE_KEY.test(key) ? `${quote}${key}${quote}=[REDACTED]` : match);
+const redactAssignment = (match: string, quote: string, key: string): string => (isSensitiveKey(key) ? `${quote}${key}${quote}=[REDACTED]` : match);
 
 /**
  * Scrub a string for persistence: the host key is replaced, and generic
@@ -90,7 +92,7 @@ export function sanitizeForStorage(value: unknown, secret: string | null, depth 
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (UNSAFE_KEY.test(key) || SENSITIVE_KEY.test(key)) continue;
+      if (UNSAFE_KEY.test(key) || isSensitiveKey(key)) continue;
       // a credential can also be smuggled as the key name itself
       if (secret !== null && secret.length > 0 && key.includes(secret)) continue;
       out[redactSecret(key, secret)] = sanitizeForStorage(item, secret, depth + 1);

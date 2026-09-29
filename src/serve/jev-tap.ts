@@ -27,11 +27,14 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { redactSecret, sanitizeForStorage, secretFingerprint } from "./jev-key.js";
-import { parseJevUpstream, type JevForwardResult, type JevTransport } from "./jev-forward.js";
+import { parseJevUpstream, forwardableRequestHeaders, type HeaderMap, type JevForwardResult, type JevTransport } from "./jev-forward.js";
 import { computeRequestHash, validateDecisionRequest, type ServeLimits, type ValidationResult } from "./protocol.js";
 import { SerialQueue } from "./serial-queue.js";
 import { recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
 import type { DecisionEngine, EngineIdentity } from "./types.js";
+
+/** Raw incoming request headers, as Node's `IncomingHttpHeaders` provides them. */
+type IncomingHeaders = Record<string, string | string[] | undefined>;
 
 export interface JevTapStats {
   enabled: boolean;
@@ -53,6 +56,8 @@ export interface JevTapStats {
 export interface TapResponse {
   status: number;
   contentType: string;
+  /** upstream response headers to return unchanged (already filtered) */
+  headers: HeaderMap;
   body: string;
 }
 
@@ -65,7 +70,7 @@ export interface TapHandoff extends TapResponse {
 }
 
 export interface JevTap {
-  handle(body: string, caller: string | null, contentType: string): Promise<TapHandoff>;
+  handle(body: string, caller: string | null, contentType: string, headers?: IncomingHeaders): Promise<TapHandoff>;
   stats(): JevTapStats;
   /** resolves when every queued Laya shadow and every uncommitted handoff is settled */
   drain(): Promise<void>;
@@ -142,6 +147,7 @@ function keyMissingForward(): JevForwardResult {
   return {
     status: 503,
     contentType: "application/json; charset=utf-8",
+    headers: {},
     body: JSON.stringify({ error: "jev key is not configured", code: "JEV_KEY_MISSING" }),
     latencyMs: 0,
     error: "JEV_KEY_MISSING",
@@ -318,10 +324,10 @@ export function createJevTap(options: JevTapOptions): JevTap {
       }
       handoffDone();
     };
-    return { status: args.forward.status, contentType: args.forward.contentType, body: args.forward.body, commit };
+    return { status: args.forward.status, contentType: args.forward.contentType, headers: args.forward.headers, body: args.forward.body, commit };
   };
 
-  const handle = async (body: string, caller: string | null, contentType: string): Promise<TapHandoff> => {
+  const handle = async (body: string, caller: string | null, contentType: string, headers?: IncomingHeaders): Promise<TapHandoff> => {
     counters.calls += 1;
     // Forward-path only: nothing here decodes, hashes, validates or hashes the
     // body, so shadow prep cannot add latency to or fail the Jev response.
@@ -344,6 +350,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
       url: upstreamUrl,
       body,
       contentType: args.contentType,
+      headers: forwardableRequestHeaders(headers),
       apiKey: options.apiKey,
       timeoutMs: options.timeoutMs,
     });
