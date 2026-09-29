@@ -49,8 +49,11 @@ export function secretFingerprint(secret: string): string {
 // Credential-name matching is word-based: camelCase and snake_case both split
 // into words, so `secretKey`/`userPassword` match while `input_tokens` (a token
 // *count*), `session_id` and `credential_type` (legitimate domain fields) do not.
+// `SENSITIVE_SUFFIX` additionally keeps the older, broader gate for a single
+// alphanumeric prefix (`Xtoken`, `AToken`, `SPassword`).
 const SENSITIVE_KEY = /(authorization|api[_-]?key)/i;
 const SENSITIVE_AMBIGUOUS = /^(?:session|credential|credentials)$/i;
+const SENSITIVE_SUFFIX = /[a-z0-9](?:password|passwd|passphrase|secret|cookie|token)(?![a-z0-9])/i;
 const SENSITIVE_WORDS = new Set(["password", "passwd", "passphrase", "secret", "cookie", "token"]);
 const keyWords = (key: string): string[] =>
   key
@@ -59,7 +62,7 @@ const keyWords = (key: string): string[] =>
     .filter((word) => word.length > 0)
     .map((word) => word.toLowerCase());
 const isSensitiveKey = (key: string): boolean =>
-  SENSITIVE_KEY.test(key) || SENSITIVE_AMBIGUOUS.test(key) || keyWords(key).some((word) => SENSITIVE_WORDS.has(word));
+  SENSITIVE_KEY.test(key) || SENSITIVE_AMBIGUOUS.test(key) || SENSITIVE_SUFFIX.test(key) || keyWords(key).some((word) => SENSITIVE_WORDS.has(word));
 
 /** Redact a `key[:=]value` assignment when the key names a credential. */
 const redactAssignment = (match: string, quote: string, key: string): string => (isSensitiveKey(key) ? `${quote}${key}${quote}=[REDACTED]` : match);

@@ -865,6 +865,28 @@ test("withholds camelCase credential names while preserving camelCase domain fie
   }
 });
 
+test("withholds prefixed sensitive words, not just word-boundary forms", async () => {
+  const h = await setup();
+  try {
+    const payload = {
+      ...basePayload(),
+      state: { Xtoken: "a", XToken: "b", AToken: "c", SPassword: "d", GSecret: "e", ACookie: "f", inputTokens: 4, tokenize: "keep" },
+    };
+    const res = await postTap(h, payload);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    const state = rec(rec(record.request).state);
+    for (const key of ["Xtoken", "XToken", "AToken", "SPassword", "GSecret", "ACookie"]) {
+      assert.equal(state[key], "[REDACTED]", `${key} must be withheld (prefixed sensitive word)`);
+    }
+    assert.equal(state.inputTokens, 4, "token counts must be preserved");
+    assert.equal(state.tokenize, "keep", "an unrelated word containing `token` must be preserved");
+  } finally {
+    await h.close();
+  }
+});
+
 test("marks redacted credential fields inside the upstream reply", async () => {
   const h = await setup({ upstreamReply: { result: "ok", api_token: "token-123", usage: { input_tokens: 7, cost: 0.001 } } });
   try {
