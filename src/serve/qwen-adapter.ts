@@ -124,6 +124,16 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+/**
+ * The support weight for one Boolean decision. The endpoint reports the
+ * probability of the *selected* value, so P(supported) is `p` for `true` and
+ * `1 - p` for `false`; without a probability, support is the hard `1`/`0`.
+ */
+function supportProbability(value: boolean, probability: unknown): number {
+  if (isFiniteNumber(probability)) return value ? probability : 1 - probability;
+  return value ? 1 : 0;
+}
+
 /** The model identity the server returned, as provenance only. */
 export function modelFromResponse(response: unknown): string | null {
   const model = asRecord(response)?.model;
@@ -138,15 +148,18 @@ export function renderQuestionText(instructions: string | object): string {
 /**
  * A caller-supplied field must never be able to inject the fixed `TRUE:`/`FALSE:`
  * section headers of the rendered Boolean question (or the classifier
- * terminator); fail closed rather than ask a spoofed question.
+ * terminator); fail closed rather than ask a spoofed question. The gate matches
+ * `\n`, `\r\n` and a bare `\r` at any line start (`m`), and the classifier
+ * sentence case-insensitively with optional terminal punctuation.
  */
-const STRUCTURAL_HEADER = /(?:\r?\n|^)[ \t]*(?:TRUE|FALSE)[ \t]*:/i;
+const STRUCTURAL_HEADER = /(?:\r?\n|\r|^)[ \t]*(?:TRUE|FALSE)[ \t]*:/im;
+const CLASSIFIER_TERMINATOR = /classify\s+only\s+from\s+the\s+supplied\s+evidence\.?/i;
 
 function assertNoInjection(label: string, text: string): void {
   if (STRUCTURAL_HEADER.test(text)) {
     throw invalid("STRUCTURAL_HEADER", `${label} contains a TRUE:/FALSE: section header`);
   }
-  if (text.includes(QWEN4B_CLASSIFY_ONLY)) {
+  if (CLASSIFIER_TERMINATOR.test(text)) {
     throw invalid("STRUCTURAL_HEADER", `${label} contains the classifier terminator sentence`);
   }
 }
@@ -301,7 +314,7 @@ function parseScoreField(qid: string, field: Record<string, unknown>, levels: st
       if (probability !== undefined && (!isFiniteNumber(probability) || probability < 0 || probability > 1)) {
         throw invalid("PROBABILITY_OUT_OF_RANGE", `fields.${qid}.${level}.probability is not a finite probability`);
       }
-      weights[level] = isFiniteNumber(probability) ? probability : value ? 1 : 0;
+      weights[level] = supportProbability(value, probability);
     }
   } else {
     const valueObject = asRecord(field.value);
@@ -314,7 +327,7 @@ function parseScoreField(qid: string, field: Record<string, unknown>, levels: st
       if (probability !== undefined && (!isFiniteNumber(probability) || probability < 0 || probability > 1)) {
         throw invalid("PROBABILITY_OUT_OF_RANGE", `fields.${qid}.probabilities.${level} is not a finite probability`);
       }
-      weights[level] = isFiniteNumber(probability) ? probability : value ? 1 : 0;
+      weights[level] = supportProbability(value, probability);
     }
   }
 
@@ -339,6 +352,22 @@ function parseScoreField(qid: string, field: Record<string, unknown>, levels: st
   return { type: "score", score: expected, legend, probabilities, confidence };
 }
 
+/**
+ * Resolve the per-question field container. The native field map surfaces each
+ * question directly (`fields.<qid>`); the older draft wrapper surfaces them one
+ * level down (`fields.result.<qid>`). A question literally named `result` makes
+ * the two shapes collide, so the wrapper is recognised only by shape: `fields`
+ * has the single key `result`, that value is not itself a field
+ * (`value`/`probability`) and it carries at least one requested question id.
+ */
+function batchFieldsContainer(fields: Record<string, unknown>, questions: Array<[string, Question]>): Record<string, unknown> {
+  const keys = Object.keys(fields);
+  if (keys.length !== 1 || keys[0] !== "result") return fields;
+  const wrapped = asRecord(fields.result);
+  if (wrapped === null || "value" in wrapped || "probability" in wrapped) return fields;
+  return questions.some(([qid]) => qid in wrapped) ? wrapped : fields;
+}
+
 /** Parse the batched reply, one answer per requested question, all-or-nothing. */
 export function parseBatchResponse(raw: unknown, questions: Array<[string, Question]>): Record<string, Qwen4bAnswer> {
   const root = asRecord(raw);
@@ -349,13 +378,11 @@ export function parseBatchResponse(raw: unknown, questions: Array<[string, Quest
   if (!first) throw invalid("MALFORMED_RESPONSE", "results[0] must be an object");
   const fields = asRecord(first.fields);
   if (!fields) throw invalid("SCHEMA_VIOLATION", "results[0].fields is missing");
-  // The draft wrapper (`{"type":"object","properties":{...}}`) would surface the
-  // per-question map one level down; the native field map surfaces it directly.
-  const wrapper = asRecord(fields.result);
+  const container = batchFieldsContainer(fields, questions);
 
   const answers: Record<string, Qwen4bAnswer> = {};
   for (const [qid, question] of questions) {
-    const field = asRecord(fields[qid]) ?? (wrapper ? asRecord(wrapper[qid]) : null);
+    const field = asRecord(container[qid]);
     if (!field) throw invalid("SCHEMA_VIOLATION", `results[0].fields.${qid} is missing`);
     if (question.type === "choice") answers[qid] = parseChoiceField(qid, field, choiceKeys(question));
     else if (question.type === "score") answers[qid] = parseScoreField(qid, field, [...question.criteria]);

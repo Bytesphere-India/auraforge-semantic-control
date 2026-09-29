@@ -169,6 +169,19 @@ export interface JevLayaPairLaya {
   error: string | null;
 }
 
+/** Build Laya's error view for the joined record. */
+export function layaErrorView(identity: EngineIdentity, latencyMs: number, error: string): JevLayaPairLaya {
+  return {
+    status: "error",
+    latency_ms: Math.max(0, Math.round(latencyMs)),
+    model: identity.model,
+    model_sha256: identity.modelSha256,
+    answers: null,
+    usage: null,
+    error,
+  };
+}
+
 /** One Jev call's upstream view inside a joined pair record. */
 export interface JevLayaPairJev {
   status: number;

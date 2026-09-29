@@ -312,7 +312,9 @@ Decision call, rendered deterministically (no LLM transforms the question pack):
 
 A question or criterion that embeds a `TRUE:`/`FALSE:` section header or the
 classifier terminator is rejected (`QWEN4B_STRUCTURAL_HEADER`) rather than asked
-with a spoofed structure. A `noul` question without criteria renders the
+with a spoofed structure. The header gate covers `\n`, `\r\n` and a bare `\r` at
+any line start, and the classifier terminator is matched case-insensitively with
+optional terminal punctuation. A `noul` question without criteria renders the
 question and the classifier line only.
 
 **Probability normalization.** The endpoint reports the probability of the
@@ -331,13 +333,18 @@ keyed by output name (as the native `{"result": {...}}` proves) and
 question id: `choice` -> `{"type":"string","enum":[<criteria keys>]}`; `score` ->
 `{"type":"object","properties":{<level>:{"type":"boolean"}}}`. The batched
 context is the canonical `state` followed by each question's id, type,
-instructions and criteria. `choice` records the selected option and its reported
-probability (the enum returns only the selection, so no full distribution is
-claimed). `score` normalizes the per-level Boolean support into a level
-distribution (per-level probabilities are used when the endpoint returns them,
-otherwise `true`/`false` become `1`/`0`), records the expected level, the level
-legend, the distribution and the `1 - normalized entropy` confidence; a field
-that supports no level fails closed (`QWEN4B_SCORE_NO_EVIDENCE`).
+instructions and criteria. The reply is read from the field map directly, with
+the draft wrapper recognised only by shape (a lone `result` object), so a
+question literally named `result` cannot be mistaken for the wrapper. `choice`
+records the selected option and its reported probability (the enum returns only
+the selection, so no full distribution is claimed). For `score`, each level's
+support weight is the reported probability when the selected value is `true` and
+`1 - probability` when it is `false` (a hard `1`/`0` when the endpoint omits a
+probability — a high probability for `false` is *low* support, never high). The
+weights are normalized into a level distribution and the record carries the
+expected level, the level legend, the distribution and the `1 - normalized
+entropy` confidence; a field that supports no level fails closed
+(`QWEN4B_SCORE_NO_EVIDENCE`).
 
 **Record and failure isolation.** The joined record gains a `qwen4b` member:
 
@@ -359,12 +366,15 @@ invalid request). Qwen4b answers are all-or-nothing: any failed call records
 `status:"error"`, `answers:null` and a short machine code (`QWEN4B_UNREACHABLE`,
 `QWEN4B_TIMEOUT`, `QWEN4B_HTTP_<status>`, `QWEN4B_MALFORMED_RESPONSE`,
 `QWEN4B_PROBABILITY_OUT_OF_RANGE`, ...), while the raw exchanges are still kept
-for audit. Qwen4b starts together with Laya and its promise never rejects, so a
-down, slow or misbehaving Qwen4b can never affect the Jev reply or the Laya
-shadow. The `qwen4b` view (including its raw exchanges) is scrubbed exactly like
-the Jev payload, so a credential cannot reach the record through the third
-shadow's audit trail. `/health` reports `qwen4b_enabled`, `qwen4b_url`,
-`qwen4b_ok` and `qwen4b_error`.
+for audit. Qwen4b starts together with Laya and its promise never rejects, and
+the third-shadow join plus the record append run **outside** Laya's serial queue
+worker: Laya's slot is released as soon as inference finishes, so a down, slow or
+hung Qwen4b can never delay the Jev reply, delay the Laya shadow, hold the queue
+or overflow later Laya shadows with `QUEUE_FULL`. `drain()` still waits for every
+detached record write, so no pair is lost at shutdown. The `qwen4b` view
+(including its raw exchanges) is scrubbed exactly like the Jev payload, so a
+credential cannot reach the record through the third shadow's audit trail.
+`/health` reports `qwen4b_enabled`, `qwen4b_url`, `qwen4b_ok` and `qwen4b_error`.
 
 ## Configuration
 
@@ -499,9 +509,11 @@ bundle before enabling CUDA.
 Covers request validation and limits, response shape/identity,
 `canonicalJson`/request hashing, the shadow-line format and its no-raw-text
 property, HTTP status codes, the engine-failure path, the Jev-tap forward/shadow
-path, the Qwen4b adapter (native `noul` rendering, probability normalization,
-the choice/score field-map mapping, fail-closed parsing, down/400/timeout error
-records and three-engine record joining), the device policy (env
+path, the Qwen4b adapter (native `noul` rendering, selected-value probability
+normalization for `noul` and per-level `score` support, the choice/score field-map
+mapping with the lone-`result` wrapper disambiguation, injection and terminator
+fail-closed parsing, down/400/timeout error records, three-engine record joining
+and the hung-Qwen4b queue-isolation guarantee), the device policy (env
 parsing, provider construction, the 2048 MiB ceiling gate, GPU-probe-gated
 CUDA→CPU fallback, the `cpu`-wins rule) and the fail-closed parity comparison.
 The CUDA probe test skips cleanly when no GPU/CUDA driver is reachable; the

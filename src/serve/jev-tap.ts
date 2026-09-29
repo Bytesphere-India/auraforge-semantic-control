@@ -30,7 +30,7 @@ import { sanitizeForStorage, secretFingerprint } from "./jev-key.js";
 import { parseJevUpstream, forwardableRequestHeaders, type HeaderMap, type JevForwardResult, type JevTransport } from "./jev-forward.js";
 import { computeRequestHash, validateDecisionRequest, type ServeLimits, type ValidationResult } from "./protocol.js";
 import { SerialQueue } from "./serial-queue.js";
-import { buildPairRecord, recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
+import { buildPairRecord, layaErrorView, recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
 import { observeQwen4b, type Qwen4bShadow, type Qwen4bShadowResult } from "./qwen-shadow.js";
 import type { DecisionEngine, EngineIdentity, JevTapStats } from "./types.js";
 
@@ -168,6 +168,18 @@ export function createJevTap(options: JevTapOptions): JevTap {
   };
   const waitForHandoffs = (): Promise<void> => (handoffs === 0 ? Promise.resolve() : new Promise<void>((resolve) => handoffWaiters.push(resolve)));
 
+  // Pair writes are detached from the serial queue (the third shadow joins the
+  // record outside Laya's slot). They are still tracked so `drain()` can wait
+  // for them on shutdown.
+  const pendingWrites = new Set<Promise<void>>();
+  const trackWrite = (task: Promise<void>): void => {
+    pendingWrites.add(task);
+    void task.then(
+      () => pendingWrites.delete(task),
+      () => pendingWrites.delete(task),
+    );
+  };
+
   /** Shadow-only prep. Never called on the forward path; may throw, and the caller of this must isolate it. */
   const prepareShadow = (body: string): ShadowPrep => {
     const parsed = parseJson(body);
@@ -204,20 +216,23 @@ export function createJevTap(options: JevTapOptions): JevTap {
     );
   };
 
-  const errorLaya = (started: number, error: string): JevLayaPairLaya => ({
-    status: "error",
-    latency_ms: Math.max(0, Math.round(now() - started)),
-    model: options.identity.model,
-    model_sha256: options.identity.modelSha256,
-    answers: null,
-    usage: null,
-    error,
-  });
-
   const failShadow = (args: ShadowArgs, prep: ShadowPrep, started: number, code: string): void => {
     counters.shadows_error += 1;
     counters.last_error = code;
-    writePair(args, prep, errorLaya(started, code), null);
+    writePair(args, prep, layaErrorView(options.identity, now() - started, code), null);
+  };
+
+  /**
+   * Join the third shadow and append the record. This runs *outside* the serial
+   * queue worker: Laya's slot is released as soon as inference finishes, so a
+   * slow/hung Qwen4b can never hold the queue and overflow later Laya shadows
+   * with `QUEUE_FULL`. `observeQwen4b` never rejects, so this cannot either.
+   */
+  const finishShadow = async (args: ShadowArgs, prep: ShadowPrep, laya: JevLayaPairLaya, qwenPromise: Promise<Qwen4bShadowResult | null>): Promise<void> => {
+    const qwen4b = await qwenPromise;
+    if (qwen4b?.status === "ok") counters.qwen4b_ok += 1;
+    else if (qwen4b !== null) counters.qwen4b_error += 1;
+    writePair(args, prep, laya, qwen4b);
   };
 
   const runShadow = async (args: ShadowArgs): Promise<void> => {
@@ -287,15 +302,12 @@ export function createJevTap(options: JevTapOptions): JevTap {
       });
       counters.shadows_error += 1;
       counters.last_error = "ENGINE_ERROR";
-      laya = errorLaya(started, "ENGINE_ERROR");
+      laya = layaErrorView(options.identity, now() - started, "ENGINE_ERROR");
     }
 
-    const qwen4b = await qwenPromise;
-    if (qwen4b !== null) {
-      if (qwen4b.status === "ok") counters.qwen4b_ok += 1;
-      else counters.qwen4b_error += 1;
-    }
-    writePair(args, prep, laya, qwen4b);
+    // Release the queue slot now: the third shadow join and the record write are
+    // detached and tracked separately.
+    trackWrite(finishShadow(args, prep, laya, qwenPromise));
   };
 
   const makeHandoff = (args: ShadowArgs): TapHandoff => {
@@ -373,6 +385,9 @@ export function createJevTap(options: JevTapOptions): JevTap {
     drain: async () => {
       await waitForHandoffs();
       await queue.idle();
+      // Detached pair writes (third-shadow join + record append) settle last;
+      // wait for every one so no record is lost at shutdown.
+      await Promise.all([...pendingWrites]);
     },
   };
 }
