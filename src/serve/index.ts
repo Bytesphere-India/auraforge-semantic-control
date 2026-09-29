@@ -19,6 +19,8 @@ import { loadEngine, warmupEngine } from "./device.js";
 import { fetchJevTransport } from "./jev-forward.js";
 import { JEV_KEY_ENV, loadJevKey } from "./jev-key.js";
 import { createJevTap } from "./jev-tap.js";
+import { fetchQwen4bTransport } from "./qwen-forward.js";
+import { createQwen4bShadow } from "./qwen-shadow.js";
 import { createServer } from "./server.js";
 import { JevLayaPairsLog, ShadowLog } from "./shadow.js";
 import type { EngineIdentity, DecisionEngine } from "./types.js";
@@ -116,6 +118,12 @@ async function main(): Promise<void> {
         pairs,
         limits: config.limits,
         queueMax: config.jev.queueMax,
+        // The third shadow is an external local GPU service; laya-serve itself
+        // stays CPU-only and never blocks on it.
+        qwen4b:
+          config.jev.qwen4bUrl === null
+            ? null
+            : createQwen4bShadow({ url: config.jev.qwen4bUrl, transport: fetchQwen4bTransport, timeoutMs: config.jev.qwen4bTimeoutMs }),
       })
     : null;
 
@@ -171,6 +179,7 @@ async function main(): Promise<void> {
         `shadow=${shadowStats.path ?? "disabled"}${shadowStats.writable ? "" : " (NOT WRITABLE)"} ` +
         `jev_upstream=${tap?.upstream ?? "disabled"} jev_key=${tap?.key_present ? "present" : "absent"} ` +
         `jev_pairs=${pairsStats.path ?? "disabled"}${pairsStats.writable ? "" : " (NOT WRITABLE)"} ` +
+        `qwen4b=${config.jev.qwen4bUrl ?? "disabled"} ` +
         `load_ms=${Date.now() - startedAtMs}\n`,
     );
   });

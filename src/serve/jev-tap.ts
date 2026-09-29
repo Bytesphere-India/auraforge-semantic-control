@@ -26,31 +26,19 @@
  * returns `503 JEV_KEY_MISSING`. The key is never logged or persisted.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { redactSecret, sanitizeForStorage, secretFingerprint } from "./jev-key.js";
-import { parseJevUpstream, forwardableRequestHeaders, mediaType, type HeaderMap, type JevForwardResult, type JevTransport } from "./jev-forward.js";
+import { sanitizeForStorage, secretFingerprint } from "./jev-key.js";
+import { parseJevUpstream, forwardableRequestHeaders, type HeaderMap, type JevForwardResult, type JevTransport } from "./jev-forward.js";
 import { computeRequestHash, validateDecisionRequest, type ServeLimits, type ValidationResult } from "./protocol.js";
 import { SerialQueue } from "./serial-queue.js";
-import { recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
-import type { DecisionEngine, EngineIdentity } from "./types.js";
+import { buildPairRecord, recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
+import { observeQwen4b, type Qwen4bShadow, type Qwen4bShadowResult } from "./qwen-shadow.js";
+import type { DecisionEngine, EngineIdentity, JevTapStats } from "./types.js";
+
+/** Re-exported so `JevTapStats` stays part of this module's public surface. */
+export type { JevTapStats } from "./types.js";
 
 /** Raw incoming request headers, as Node's `IncomingHttpHeaders` provides them. */
 type IncomingHeaders = Record<string, string | string[] | undefined>;
-
-export interface JevTapStats {
-  enabled: boolean;
-  upstream: string;
-  key_present: boolean;
-  /** non-reversible; safe to expose */
-  key_fingerprint: string | null;
-  calls: number;
-  forwarded_ok: number;
-  forwarded_error: number;
-  shadows_ok: number;
-  shadows_error: number;
-  queued: number;
-  queue_max: number;
-  last_error: string | null;
-}
 
 /** What the HTTP layer returns to the caller: the upstream response, unchanged. */
 export interface TapResponse {
@@ -88,6 +76,11 @@ export interface JevTapOptions {
   limits: ServeLimits;
   /** max queued Laya shadows; overflow still writes a pair with laya.error QUEUE_FULL */
   queueMax?: number;
+  /**
+   * Optional third shadow: Qwen4b Parallel Decision. Runs concurrently with Laya
+   * and joins the same record; its failure is recorded and never propagated.
+   */
+  qwen4b?: Qwen4bShadow | null;
   now?: () => number;
   clock?: () => Date;
   newId?: () => string;
@@ -127,10 +120,6 @@ function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
-}
-
 /** Synthesized upstream view when the tap refuses to forward (no host key). */
 function keyMissingForward(): JevForwardResult {
   return {
@@ -152,7 +141,16 @@ export function createJevTap(options: JevTapOptions): JevTap {
   const queue = new SerialQueue(queueMax);
   const validateRequest = options.validateRequest ?? validateDecisionRequest;
   const hashRequest = options.hashRequest ?? computeRequestHash;
-  const counters = { calls: 0, forwarded_ok: 0, forwarded_error: 0, shadows_ok: 0, shadows_error: 0, last_error: null as string | null };
+  const counters = {
+    calls: 0,
+    forwarded_ok: 0,
+    forwarded_error: 0,
+    shadows_ok: 0,
+    shadows_error: 0,
+    qwen4b_ok: 0,
+    qwen4b_error: 0,
+    last_error: null as string | null,
+  };
 
   // In-flight handoffs between `handle()` returning and `commit()` being called.
   let handoffs = 0;
@@ -185,38 +183,25 @@ export function createJevTap(options: JevTapOptions): JevTap {
     return { parsed: undefined, payloadSha, requestHash: payloadSha, validation: null };
   };
 
-  const writePair = (args: ShadowArgs, prep: ShadowPrep, laya: JevLayaPairLaya): void => {
-    const replyParsed = parseJson(args.forward.body);
-    const replyRecord = asRecord(replyParsed);
-    const redacted: string[] = [];
-    const usage = replyRecord && "usage" in replyRecord ? sanitizeForStorage(replyRecord.usage, options.apiKey) : null;
-    options.pairs.record({
-      schema: 1,
-      kind: "jev_laya_pair",
-      ts: clock().toISOString(),
-      received_at: args.receivedAt,
-      request_id: args.requestId,
-      caller: args.caller === null ? null : redactSecret(args.caller, options.apiKey),
-      request_hash: prep.requestHash,
-      payload_sha256: prep.payloadSha,
-      request: prep.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(prep.parsed, options.apiKey, redacted, "request"),
-      forwarded: { url: upstreamUrl, content_type: mediaType(args.contentType) },
-      jev: {
-        status: args.forward.status,
-        ok: args.forward.error === null && args.forward.status >= 200 && args.forward.status < 300,
-        content_type: mediaType(args.forward.contentType),
-        latency_ms: Math.max(0, Math.round(args.forward.latencyMs)),
-        reply:
-          args.forward.error === null && replyParsed !== undefined
-            ? sanitizeForStorage(replyParsed, options.apiKey, redacted, "jev.reply")
-            : redactSecret(args.forward.body, options.apiKey),
-        model: typeof replyRecord?.model === "string" ? replyRecord.model : null,
-        usage,
-        error: args.forward.error,
-      },
-      laya,
-      redacted_fields: redacted.length > 0 ? redacted : undefined,
-    });
+  const writePair = (args: ShadowArgs, prep: ShadowPrep, laya: JevLayaPairLaya, qwen4b: Qwen4bShadowResult | null): void => {
+    options.pairs.record(
+      buildPairRecord({
+        forward: args.forward,
+        receivedAt: args.receivedAt,
+        requestId: args.requestId,
+        caller: args.caller,
+        contentType: args.contentType,
+        body: args.body,
+        requestHash: prep.requestHash,
+        payloadSha256: prep.payloadSha,
+        parsed: prep.parsed,
+        laya,
+        qwen4b,
+        upstreamUrl,
+        apiKey: options.apiKey,
+        ts: clock().toISOString(),
+      }),
+    );
   };
 
   const errorLaya = (started: number, error: string): JevLayaPairLaya => ({
@@ -232,7 +217,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
   const failShadow = (args: ShadowArgs, prep: ShadowPrep, started: number, code: string): void => {
     counters.shadows_error += 1;
     counters.last_error = code;
-    writePair(args, prep, errorLaya(started, code));
+    writePair(args, prep, errorLaya(started, code), null);
   };
 
   const runShadow = async (args: ShadowArgs): Promise<void> => {
@@ -261,6 +246,12 @@ export function createJevTap(options: JevTapOptions): JevTap {
     }
 
     const { state, questions } = prep.validation;
+
+    // The third shadow starts together with Laya and never rejects, so a
+    // slow/down/misbehaving Qwen4b can never delay or fail the Jev reply or Laya.
+    const qwenPromise = observeQwen4b(options.qwen4b, state, questions);
+
+    let laya: JevLayaPairLaya;
     try {
       const result = await options.engine.systemOne(state, questions);
       const latencyMs = Math.max(0, now() - started);
@@ -274,7 +265,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
         error: "MISSING_ANSWER",
       });
       counters.shadows_ok += 1;
-      writePair(args, prep, {
+      laya = {
         status: "ok",
         latency_ms: Math.round(latencyMs),
         model: options.identity.model,
@@ -282,7 +273,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
         answers: sanitizeForStorage(result.answers, options.apiKey) as JevLayaPairLaya["answers"],
         usage: result.usage,
         error: null,
-      });
+      };
     } catch {
       const latencyMs = Math.max(0, now() - started);
       recordShadowAnswers(options.shadow, options.identity, {
@@ -294,8 +285,17 @@ export function createJevTap(options: JevTapOptions): JevTap {
         inputTokens: 0,
         error: "ENGINE_ERROR",
       });
-      failShadow(args, prep, started, "ENGINE_ERROR");
+      counters.shadows_error += 1;
+      counters.last_error = "ENGINE_ERROR";
+      laya = errorLaya(started, "ENGINE_ERROR");
     }
+
+    const qwen4b = await qwenPromise;
+    if (qwen4b !== null) {
+      if (qwen4b.status === "ok") counters.qwen4b_ok += 1;
+      else counters.qwen4b_error += 1;
+    }
+    writePair(args, prep, laya, qwen4b);
   };
 
   const makeHandoff = (args: ShadowArgs): TapHandoff => {
@@ -362,6 +362,10 @@ export function createJevTap(options: JevTapOptions): JevTap {
       forwarded_error: counters.forwarded_error,
       shadows_ok: counters.shadows_ok,
       shadows_error: counters.shadows_error,
+      qwen4b_enabled: options.qwen4b != null,
+      qwen4b_url: options.qwen4b?.url ?? null,
+      qwen4b_ok: counters.qwen4b_ok,
+      qwen4b_error: counters.qwen4b_error,
       queued: queue.pending,
       queue_max: queueMax,
       last_error: counters.last_error,

@@ -7,7 +7,8 @@
  *   request hash, question type, answer, probabilities and latency. The raw
  *   request text is an input to the request hash only and is NEVER written here.
  * - `jev-laya-pairs.jsonl` (the Jev shadow tap): one joined line per Jev call
- *   with the full request payload, Jev's reply and Laya's reply.
+ *   with the full request payload, Jev's reply, Laya's reply and (when
+ *   configured) the Qwen4b third-shadow reply.
  *
  * Audit writes must not be able to take down the serve path, so append failures
  * are swallowed and reported through `stats()` (`/health`) instead.
@@ -15,6 +16,9 @@
 import { appendFileSync, closeSync, mkdirSync, openSync } from "node:fs";
 import path from "node:path";
 import type { Answer, Question } from "../types.js";
+import { mediaType, type JevForwardResult } from "./jev-forward.js";
+import { redactSecret, sanitizeForStorage } from "./jev-key.js";
+import type { Qwen4bShadowResult } from "./qwen-adapter.js";
 import type { EngineIdentity } from "./types.js";
 
 export interface JsonlLogStats {
@@ -178,8 +182,9 @@ export interface JevLayaPairJev {
 }
 
 /**
- * The joined record: full request payload, Jev's full reply and Laya's full
- * reply, keyed by caller and request hash. Credentials never appear here.
+ * The joined record: full request payload, Jev's full reply, Laya's full
+ * reply and Qwen4b's shadow reply, keyed by caller and request hash. Credentials
+ * never appear here.
  */
 export interface JevLayaPairRecord {
   schema: 1;
@@ -196,6 +201,79 @@ export interface JevLayaPairRecord {
   forwarded: { url: string; content_type: string };
   jev: JevLayaPairJev;
   laya: JevLayaPairLaya;
+  /** the third (Qwen4b) shadow, or null when disabled/not attempted */
+  qwen4b: Qwen4bShadowResult | null;
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+/** Everything the joined record needs; the tap supplies it and the log appends it. */
+export interface PairRecordInputs {
+  forward: JevForwardResult;
+  receivedAt: string;
+  requestId: string;
+  caller: string | null;
+  contentType: string;
+  body: string;
+  requestHash: string;
+  payloadSha256: string;
+  parsed: unknown;
+  laya: JevLayaPairLaya;
+  qwen4b: Qwen4bShadowResult | null;
+  upstreamUrl: string;
+  apiKey: string | null;
+  /** record timestamp (ISO) */
+  ts: string;
+}
+
+/**
+ * Build the joined record. The Qwen4b view carries the full request/response
+ * exchanges, so it is scrubbed exactly like the Jev payload: a credential must
+ * never reach the record through the third shadow's raw audit trail.
+ */
+export function buildPairRecord(inputs: PairRecordInputs): JevLayaPairRecord {
+  const replyParsed = parseJson(inputs.forward.body);
+  const replyRecord = asRecord(replyParsed);
+  const redacted: string[] = [];
+  const usage = replyRecord && "usage" in replyRecord ? sanitizeForStorage(replyRecord.usage, inputs.apiKey) : null;
+  return {
+    schema: 1,
+    kind: "jev_laya_pair",
+    ts: inputs.ts,
+    received_at: inputs.receivedAt,
+    request_id: inputs.requestId,
+    caller: inputs.caller === null ? null : redactSecret(inputs.caller, inputs.apiKey),
+    request_hash: inputs.requestHash,
+    payload_sha256: inputs.payloadSha256,
+    request: inputs.parsed === undefined ? redactSecret(inputs.body, inputs.apiKey) : sanitizeForStorage(inputs.parsed, inputs.apiKey, redacted, "request"),
+    forwarded: { url: inputs.upstreamUrl, content_type: mediaType(inputs.contentType) },
+    jev: {
+      status: inputs.forward.status,
+      ok: inputs.forward.error === null && inputs.forward.status >= 200 && inputs.forward.status < 300,
+      content_type: mediaType(inputs.forward.contentType),
+      latency_ms: Math.max(0, Math.round(inputs.forward.latencyMs)),
+      reply:
+        inputs.forward.error === null && replyParsed !== undefined
+          ? sanitizeForStorage(replyParsed, inputs.apiKey, redacted, "jev.reply")
+          : redactSecret(inputs.forward.body, inputs.apiKey),
+      model: typeof replyRecord?.model === "string" ? replyRecord.model : null,
+      usage,
+      error: inputs.forward.error,
+    },
+    laya: inputs.laya,
+    qwen4b: inputs.qwen4b === null ? null : (sanitizeForStorage(inputs.qwen4b, inputs.apiKey, redacted, "qwen4b") as Qwen4bShadowResult),
+    redacted_fields: redacted.length > 0 ? redacted : undefined,
+  };
 }
 
 export class JevLayaPairsLog extends JsonlAppendLog {

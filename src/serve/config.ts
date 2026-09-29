@@ -9,12 +9,14 @@ import path from "node:path";
 import { loadDeviceConfig, type DeviceConfig } from "./device.js";
 import { parseJevUpstream } from "./jev-forward.js";
 import { DEFAULT_LIMITS, type ServeLimits } from "./protocol.js";
+import { parseQwen4bUrl } from "./qwen-forward.js";
 
 export const DEFAULT_MODEL_DIR = "/opt/auraforge/models/laya/base-fp32";
 export const DEFAULT_SHADOW_LOG = path.join(os.homedir(), ".auraforge-work", "shadow", "laya-decisions.jsonl");
 export const DEFAULT_JEV_UPSTREAM = "https://openrouter.ai/api/alpha/decisions";
 export const DEFAULT_JEV_PAIRS_LOG = path.join(os.homedir(), ".auraforge-work", "shadow", "jev-laya-pairs.jsonl");
 export const DEFAULT_JEV_SECRETS = path.join(os.homedir(), ".config", "auraforge", "secrets.env");
+export const DEFAULT_QWEN4B_URL = "http://127.0.0.1:8082/v1/decision";
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 8790;
 
@@ -33,6 +35,14 @@ export interface JevTapConfig {
   queueMax: number;
   /** permit a loopback upstream (self-hosted Jev); off by default */
   allowLoopback: boolean;
+  /**
+   * Third shadow: the local GPU Qwen4b Parallel Decision endpoint. `null`
+   * disables it (`LAYA_SERVE_QWEN4B_URL=""`). `laya-serve` itself stays CPU-only;
+   * Qwen4b is an external local service reached over loopback.
+   */
+  qwen4bUrl: string | null;
+  /** Qwen4b per-call timeout (the tap is never blocked by it) */
+  qwen4bTimeoutMs: number;
 }
 
 export interface ServeConfig {
@@ -180,6 +190,19 @@ export function resolveJevUpstream(raw: string, allowLoopback: boolean): string 
   return url.toString();
 }
 
+/**
+ * The Qwen4b shadow is an external *local* GPU service, so it must be loopback:
+ * anything else would turn a shadow into an SSRF primitive against the network.
+ * An empty value disables the third shadow.
+ */
+export function resolveQwen4bUrl(raw: string): string {
+  const url = parseQwen4bUrl(raw);
+  if (!isLoopbackHost(url.hostname)) {
+    throw new Error(`LAYA_SERVE_QWEN4B_URL must be a loopback address (the local Qwen4b GPU server); got ${JSON.stringify(url.hostname)}`);
+  }
+  return url.toString();
+}
+
 export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConfig {
   const host = env.LAYA_SERVE_HOST || DEFAULT_HOST;
   if (!LOOPBACK.has(host)) {
@@ -191,6 +214,7 @@ export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConf
   const pairsRaw = env.LAYA_SERVE_JEV_PAIRS_LOG === undefined ? DEFAULT_JEV_PAIRS_LOG : env.LAYA_SERVE_JEV_PAIRS_LOG;
   const allowLoopback = boolean(env, "LAYA_SERVE_JEV_ALLOW_LOOPBACK", false);
   const upstreamUrl = resolveJevUpstream(env.LAYA_SERVE_JEV_UPSTREAM || DEFAULT_JEV_UPSTREAM, allowLoopback);
+  const qwenRaw = env.LAYA_SERVE_QWEN4B_URL === undefined ? DEFAULT_QWEN4B_URL : env.LAYA_SERVE_QWEN4B_URL;
 
   return {
     host,
@@ -214,6 +238,8 @@ export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConf
       timeoutMs: positiveInt(env, "LAYA_SERVE_JEV_TIMEOUT_MS", 60_000, 300_000),
       queueMax: positiveInt(env, "LAYA_SERVE_JEV_QUEUE_MAX", 256, 1_000_000),
       allowLoopback,
+      qwen4bUrl: qwenRaw === "" ? null : resolveQwen4bUrl(qwenRaw),
+      qwen4bTimeoutMs: positiveInt(env, "LAYA_SERVE_QWEN4B_TIMEOUT_MS", 30_000, 300_000),
     },
   };
 }

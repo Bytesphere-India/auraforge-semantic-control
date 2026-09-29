@@ -5,8 +5,13 @@ on **127.0.0.1:8790**, next to Jev. It speaks the same typed-question
 request/response shape as Jev's OpenRouter `/api/alpha/decisions` API, so a
 caller can switch engine by URL alone. It also hosts the **Jev shadow tap**
 (`POST /jev/api/alpha/decisions`): a transparent forwarder to Jev that shadows
-every Jev call through Laya and writes one joined record per call. The service
-only **serves and logs**; it never learns online.
+every Jev call through Laya and, when configured, through a local GPU
+**Qwen4b Parallel Decision** server, writing one joined record per call. The
+service only **serves and logs**; it never learns online.
+
+`laya-serve` itself stays **CPU-only** (fp32 is forced to CPU by the device
+policy); Qwen4b is a separate, external local GPU service reached over loopback
+and is never allowed to delay or fail the Jev reply or the Laya shadow.
 
 ## Invariants
 
@@ -25,8 +30,10 @@ only **serves and logs**; it never learns online.
   ≤ 2048 MiB.
 - **No unrequested egress.** The decision route loads the model from a local
   directory (`Laya.load({ modelDir })`), never the network. The only outbound
-  call in the process is the tap forwarding a caller's request to the
-  operator-configured Jev upstream.
+  calls in the process are the tap forwarding a caller's request to the
+  operator-configured Jev upstream and, when enabled, the third shadow posting
+  the same bounded question to the operator-configured **loopback** Qwen4b
+  endpoint (a non-loopback URL is refused at startup).
 - **No leaked secrets.** The decision route reads no credentials. The tap holds
   the host-side Jev key only to inject it into the upstream `Authorization`
   header; the key is never logged, returned, or written to a shadow record, and
@@ -238,11 +245,13 @@ Jev to Laya without changing anything but the URL:
    after the response, on the queue, not on the forward path, so prep can never
    add latency to or fail the Jev response (a prep failure is recorded as
    `SHADOW_PREP_ERROR`). The payload then runs through Laya on a serial queue (no
-   short timeout; overflow is reported, not dropped). A slow or failing Laya can
-   never delay or fail the Jev response.
+   short timeout; overflow is reported, not dropped) and, when configured,
+   through the Qwen4b shadow at the same time. A slow or failing Laya **or**
+   Qwen4b can never delay or fail the Jev response.
 3. **One joined record per call** (`jev-laya-pairs.jsonl`): the full request
    payload, Jev's full reply (status, answer, probabilities, usage/cost,
    latency), Laya's full reply (answers, probabilities, latency, model sha),
+   Qwen4b's shadow reply (answers, raw exchanges, latency, returned model), the
    caller, request hash and timestamps. When a credential-named field's value is
    withheld, the record carries a `redacted_fields` list of the affected paths so
    a truncated payload is never silently presented as full. If Laya fails, the
@@ -279,6 +288,84 @@ Jev to Laya without changing anything but the URL:
 The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 `503 JEV_TAP_DISABLED`).
 
+### Qwen4b third shadow
+
+When `LAYA_SERVE_QWEN4B_URL` is non-empty (the default is the local GPU
+`http://127.0.0.1:8082/v1/decision`), the same request is also put to the
+llama.cpp **Parallel Decision** server as a third, strictly advisory shadow. The
+endpoint must be loopback (`http`/`https`, no embedded credentials, no fragment);
+anything else fails startup, so a shadow can never become an SSRF primitive.
+`laya-serve` remains CPU-only — Qwen4b is an external local GPU service.
+
+**Semantic parity (`noul`).** Every `noul` question is one native Parallel
+Decision call, rendered deterministically (no LLM transforms the question pack):
+
+```json
+{
+  "instructions": "<question>\n\nTRUE:\n<true criterion>\n\nFALSE:\n<false criterion>\n\nClassify only from the supplied evidence.",
+  "schema": { "result": { "type": "boolean", "description": "Does the evidence support the predicate?" } },
+  "contexts": ["<canonical JSON of state>"],
+  "mode": "tree",
+  "cache_prompt": true
+}
+```
+
+A question or criterion that embeds a `TRUE:`/`FALSE:` section header or the
+classifier terminator is rejected (`QWEN4B_STRUCTURAL_HEADER`) rather than asked
+with a spoofed structure. A `noul` question without criteria renders the
+question and the classifier line only.
+
+**Probability normalization.** The endpoint reports the probability of the
+*selected* value, not P(TRUE): `value = true` yields `p_true = p`,
+`p_false = 1 - p`; `value = false` yields `p_true = 1 - p`, `p_false = p`. A
+probability that is not finite or is outside `[0, 1]`, a missing/non-boolean
+result, a disagreement between `results[0].decision.result` and
+`results[0].fields.result.value`, or an unparseable body becomes an error record
+and **never** an answer.
+
+**`choice` / `score` (older draft mapping).** All non-`noul` questions go in one
+batched call. The draft's `{"type":"object","properties":{...}}` wrapper is not
+the native format — the verified Parallel Decision `schema` is a *field map*
+keyed by output name (as the native `{"result": {...}}` proves) and
+`results[0].fields.<name>` mirrors it — so the batch sends a field map keyed by
+question id: `choice` -> `{"type":"string","enum":[<criteria keys>]}`; `score` ->
+`{"type":"object","properties":{<level>:{"type":"boolean"}}}`. The batched
+context is the canonical `state` followed by each question's id, type,
+instructions and criteria. `choice` records the selected option and its reported
+probability (the enum returns only the selection, so no full distribution is
+claimed). `score` normalizes the per-level Boolean support into a level
+distribution (per-level probabilities are used when the endpoint returns them,
+otherwise `true`/`false` become `1`/`0`), records the expected level, the level
+legend, the distribution and the `1 - normalized entropy` confidence; a field
+that supports no level fails closed (`QWEN4B_SCORE_NO_EVIDENCE`).
+
+**Record and failure isolation.** The joined record gains a `qwen4b` member:
+
+```json
+{
+  "qwen4b": {
+    "status": "ok",
+    "latency_ms": 323,
+    "model": "Qwen3.5-4B-IQ4_XS.gguf",
+    "answers": { "result": { "type": "noul", "noul": 0.9879, "p_true": 0.9879, "p_false": 0.0121 } },
+    "raw": [{ "question_ids": ["result"], "request": { "…": "…" }, "status": 200, "response": { "…": "…" }, "error": null, "latency_ms": 320 }],
+    "error": null
+  }
+}
+```
+
+The member is `null` when the shadow is disabled or was never attempted (an
+invalid request). Qwen4b answers are all-or-nothing: any failed call records
+`status:"error"`, `answers:null` and a short machine code (`QWEN4B_UNREACHABLE`,
+`QWEN4B_TIMEOUT`, `QWEN4B_HTTP_<status>`, `QWEN4B_MALFORMED_RESPONSE`,
+`QWEN4B_PROBABILITY_OUT_OF_RANGE`, ...), while the raw exchanges are still kept
+for audit. Qwen4b starts together with Laya and its promise never rejects, so a
+down, slow or misbehaving Qwen4b can never affect the Jev reply or the Laya
+shadow. The `qwen4b` view (including its raw exchanges) is scrubbed exactly like
+the Jev payload, so a credential cannot reach the record through the third
+shadow's audit trail. `/health` reports `qwen4b_enabled`, `qwen4b_url`,
+`qwen4b_ok` and `qwen4b_error`.
+
 ## Configuration
 
 | Env                             | Default                                         | Meaning                                                                           |
@@ -305,6 +392,8 @@ The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 | `LAYA_SERVE_JEV_SECRETS`        | `~/.config/auraforge/secrets.env`               | file searched for the key                                                         |
 | `LAYA_SERVE_JEV_TIMEOUT_MS`     | `60000`                                         | upstream forward timeout                                                          |
 | `LAYA_SERVE_JEV_QUEUE_MAX`      | `256`                                           | queued Laya shadows before `QUEUE_FULL`                                           |
+| `LAYA_SERVE_QWEN4B_URL`         | `http://127.0.0.1:8082/v1/decision`             | third shadow; loopback only; empty disables                                       |
+| `LAYA_SERVE_QWEN4B_TIMEOUT_MS`  | `30000`                                         | Qwen4b per-call timeout (never blocks the tap)                                    |
 
 The upstream must be a valid `http(s)` URL without embedded credentials. Loopback
 is rejected unless `LAYA_SERVE_JEV_ALLOW_LOOPBACK=1`, and link-local/metadata/
@@ -403,13 +492,16 @@ bundle before enabling CUDA.
 ## Tests
 
 ```sh
-./node_modules/.bin/tsx --test test/test_serve_protocol.ts test/test_serve_device.ts test/test_serve_shadow.ts test/test_serve_http.ts test/test_serve_parity.ts
+./node_modules/.bin/tsx --test test/test_serve_protocol.ts test/test_serve_device.ts test/test_serve_shadow.ts test/test_serve_http.ts test/test_serve_jev_tap.ts test/test_serve_qwen4b.ts test/test_serve_parity.ts
 # or: yarn test:serve
 ```
 
 Covers request validation and limits, response shape/identity,
 `canonicalJson`/request hashing, the shadow-line format and its no-raw-text
-property, HTTP status codes, the engine-failure path, the device policy (env
+property, HTTP status codes, the engine-failure path, the Jev-tap forward/shadow
+path, the Qwen4b adapter (native `noul` rendering, probability normalization,
+the choice/score field-map mapping, fail-closed parsing, down/400/timeout error
+records and three-engine record joining), the device policy (env
 parsing, provider construction, the 2048 MiB ceiling gate, GPU-probe-gated
 CUDA→CPU fallback, the `cpu`-wins rule) and the fail-closed parity comparison.
 The CUDA probe test skips cleanly when no GPU/CUDA driver is reachable; the

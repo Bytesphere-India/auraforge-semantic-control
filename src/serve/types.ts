@@ -34,6 +34,28 @@ export interface DecisionEngine {
   systemOne(state: unknown, questions: Record<string, Question>): Promise<SystemOneResult<Record<string, Question>>>;
 }
 
+/** `/health` view of the Jev shadow tap, including the Qwen4b third-shadow counters. */
+export interface JevTapStats {
+  enabled: boolean;
+  upstream: string;
+  key_present: boolean;
+  /** non-reversible; safe to expose */
+  key_fingerprint: string | null;
+  calls: number;
+  forwarded_ok: number;
+  forwarded_error: number;
+  shadows_ok: number;
+  shadows_error: number;
+  /** third shadow (Qwen4b) configuration and counters; disabled when url is null */
+  qwen4b_enabled: boolean;
+  qwen4b_url: string | null;
+  qwen4b_ok: number;
+  qwen4b_error: number;
+  queued: number;
+  queue_max: number;
+  last_error: string | null;
+}
+
 /** Successful `/api/alpha/decisions` body: a Jev-compatible superset. */
 export interface DecisionResponseBody {
   engine: string;
