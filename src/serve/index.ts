@@ -78,8 +78,10 @@ async function main(): Promise<void> {
   };
 
   // Load the model exactly once, honoring the CUDA/CPU policy. `loadEngine`
-  // falls back to CPU (and logs) when CUDA cannot initialize, so the service
-  // never crashes because of a missing/broken GPU.
+  // refuses a bundle that cannot meet the 2048 MiB VRAM ceiling and falls back to
+  // CPU (logging) when the GPU probe or the real session cannot initialize, so
+  // the service never crashes because of a missing/broken GPU and never claims
+  // `cuda` for a provider stack that cannot run.
   const startedAtMs = Date.now();
   const outcome = await loadEngine({ modelDir: config.modelDir, cfg: config.device });
   const laya = outcome.laya;
@@ -164,7 +166,8 @@ async function main(): Promise<void> {
         `model_sha256=${identity.modelSha256} weights_sha256=${identity.modelDataSha256 ?? "unhashed"} ` +
         `dir=${identity.modelDir} calibration=${identity.calibrationStatus} ` +
         `device=${device} providers=${identity.executionProviders.join(",")} ` +
-        `gpu_mem_limit_mb=${config.device.gpuMemMb} warmed=${warmed ? "yes" : "no"} ` +
+        `vram_ceiling=${outcome.ceiling ? "forced-cpu" : "ok"} gpu_mem_limit_mb=${config.device.gpuMemMb} ` +
+        `warmed=${warmed ? "yes" : "no"} ` +
         `shadow=${shadowStats.path ?? "disabled"}${shadowStats.writable ? "" : " (NOT WRITABLE)"} ` +
         `jev_upstream=${tap?.upstream ?? "disabled"} jev_key=${tap?.key_present ? "present" : "absent"} ` +
         `jev_pairs=${pairsStats.path ?? "disabled"}${pairsStats.writable ? "" : " (NOT WRITABLE)"} ` +

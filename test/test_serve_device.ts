@@ -1,7 +1,8 @@
 /**
- * Device-policy tests: env parsing, execution-provider construction, the CUDA→CPU
- * fallback and the GPU probe. Everything here runs offline; the one test that
- * needs a real GPU skips cleanly when CUDA is absent.
+ * Device-policy tests: env parsing, execution-provider construction, the 2048 MiB
+ * VRAM ceiling gate, the CUDA→CPU fallback and the GPU probe. Everything here
+ * runs offline; the one test that needs a real GPU skips cleanly when CUDA is
+ * absent.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -9,10 +10,14 @@ import type { Laya, LayaOptions } from "../src/laya.js";
 import {
   buildExecutionProviders,
   buildSessionOptions,
+  gpuCeilingViolation,
+  isFp32ModelDir,
   isGpuAttempt,
   loadDeviceConfig,
   loadEngine,
+  MAX_GPU_WEIGHTS_BYTES,
   probeCuda,
+  probeProviders,
   providerName,
   warmupEngine,
   type DeviceConfig,
@@ -25,6 +30,14 @@ const fakeLaya = (providers: string[]): Laya =>
   }) as unknown as Laya;
 
 const names = (options: LayaOptions): string[] => (options.executionProviders ?? []).map(providerName);
+
+const collectLoader =
+  (calls: string[][]) =>
+  async (options: LayaOptions): Promise<Laya> => {
+    const requested = names(options);
+    calls.push(requested);
+    return fakeLaya(requested);
+  };
 
 test("loadDeviceConfig defaults to cuda with a 2048 MiB ceiling and device 0", () => {
   const cfg = loadDeviceConfig({});
@@ -86,23 +99,81 @@ test("LAYA_SERVE_PROVIDERS overrides the device-derived list (TensorRT for FP8/N
   assert.equal(loadDeviceConfig({ LAYA_SERVE_PROVIDERS: "" }).providers, null);
 });
 
-test("loadEngine falls back to cpu from an explicit TensorRT provider list", async () => {
+test("LAYA_SERVE_DEVICE=cpu wins over a GPU LAYA_SERVE_PROVIDERS list", () => {
+  assert.throws(() => loadDeviceConfig({ LAYA_SERVE_DEVICE: "cpu", LAYA_SERVE_PROVIDERS: "tensorrt,cuda,cpu" }), /conflicts with GPU entries/);
+  assert.deepEqual(loadDeviceConfig({ LAYA_SERVE_DEVICE: "cpu", LAYA_SERVE_PROVIDERS: "cpu" }).providers, ["cpu"]);
+  // Defense in depth: a hand-built cfg cannot smuggle GPU providers past the cpu opt-out.
+  const handBuilt: DeviceConfig = { ...loadDeviceConfig({ LAYA_SERVE_PROVIDERS: "tensorrt,cuda,cpu" }), requested: "cpu" };
+  assert.deepEqual(buildExecutionProviders(handBuilt), ["cpu"]);
+  assert.equal(isGpuAttempt(buildExecutionProviders(handBuilt)), false);
+});
+
+test("gpuCeilingViolation refuses the fp32 bundle and oversized weights", () => {
+  assert.equal(isFp32ModelDir("/opt/auraforge/models/laya/base-fp32"), true);
+  assert.equal(isFp32ModelDir("/models/laya/base-fp16"), false);
+  assert.match(gpuCeilingViolation("/opt/auraforge/models/laya/base-fp32", null) ?? "", /fp32/);
+  assert.match(gpuCeilingViolation("/models/laya/base-fp16", MAX_GPU_WEIGHTS_BYTES + 1) ?? "", /over the .* GPU budget/);
+  assert.equal(gpuCeilingViolation("/models/laya/base-fp16", 800_000_000), null);
+  assert.equal(gpuCeilingViolation("/models/laya/base-fp16", null), null);
+});
+
+test("loadEngine forces the fp32 default bundle to cpu before any GPU attempt", async () => {
   const calls: string[][] = [];
-  const load = async (options: LayaOptions): Promise<Laya> => {
-    const requested = names(options);
-    calls.push(requested);
-    if (requested.includes("tensorrt")) throw new Error("libnvinfer.so.10: cannot open shared object file");
-    return fakeLaya(requested);
-  };
+  let probes = 0;
   const outcome = await loadEngine({
-    modelDir: "/does/not/exist",
-    cfg: loadDeviceConfig({ LAYA_SERVE_PROVIDERS: "tensorrt,cuda,cpu" }),
-    load,
+    modelDir: "/opt/auraforge/models/laya/base-fp32",
+    cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
+    load: collectLoader(calls),
+    probe: async () => {
+      probes += 1;
+      return { available: true, reason: null };
+    },
+    weightsBytes: () => null,
     log: () => undefined,
   });
   assert.equal(outcome.device, "cpu");
-  assert.deepEqual(calls, [["tensorrt", "cuda", "cpu"], ["cpu"]]);
-  assert.equal(outcome.fallback?.from, "cuda");
+  assert.deepEqual(outcome.providers, ["cpu"]);
+  assert.deepEqual(calls, [["cpu"]]);
+  assert.equal(probes, 0, "the ceiling gate must run before the GPU probe");
+  assert.match(outcome.ceiling?.reason ?? "", /fp32/);
+  assert.equal(outcome.fallback, null);
+});
+
+test("loadEngine refuses an oversized bundle even when its name looks quantized", async () => {
+  const calls: string[][] = [];
+  let probes = 0;
+  const outcome = await loadEngine({
+    modelDir: "/models/laya/base-fp16",
+    cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
+    load: collectLoader(calls),
+    probe: async () => {
+      probes += 1;
+      return { available: true, reason: null };
+    },
+    weightsBytes: () => MAX_GPU_WEIGHTS_BYTES + 1,
+    log: () => undefined,
+  });
+  assert.equal(outcome.device, "cpu");
+  assert.deepEqual(calls, [["cpu"]]);
+  assert.equal(probes, 0);
+  assert.match(outcome.ceiling?.reason ?? "", /GPU budget/);
+});
+
+test("loadEngine allows a small quantized bundle on the verified GPU path", async () => {
+  const calls: string[][] = [];
+  const outcome = await loadEngine({
+    modelDir: "/models/laya/base-fp16",
+    cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
+    load: collectLoader(calls),
+    probe: async () => ({ available: true, reason: null }),
+    weightsBytes: () => 800_000_000,
+    log: () => undefined,
+  });
+  assert.equal(outcome.device, "cuda");
+  assert.deepEqual(outcome.providers, ["cuda", "cpu"]);
+  assert.deepEqual(calls, [["cuda", "cpu"]]);
+  assert.equal(outcome.ceiling, null);
+  assert.equal(outcome.fallback, null);
 });
 
 test("buildSessionOptions always optimizes the graph and passes CPU threads only when set", () => {
@@ -116,39 +187,47 @@ test("buildSessionOptions always optimizes the graph and passes CPU threads only
   assert.equal(threaded.interOpNumThreads, 2);
 });
 
-test("loadEngine falls back from cuda to cpu and logs the reason", async () => {
+test("loadEngine falls back from cuda to cpu and logs the probe reason", async () => {
   const calls: string[][] = [];
   const logs: string[] = [];
-  const load = async (options: LayaOptions): Promise<Laya> => {
-    const requested = names(options);
-    calls.push(requested);
-    if (requested.includes("cuda")) throw new Error("CUDA failure: no device\nsecond line");
-    return fakeLaya(requested);
-  };
   const outcome = await loadEngine({
     modelDir: "/does/not/exist",
     cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
-    load,
+    load: collectLoader(calls),
+    probe: async () => ({ available: false, reason: "CUDA failure: no device\nsecond line" }),
     log: (message) => logs.push(message),
   });
   assert.equal(outcome.device, "cpu");
   assert.deepEqual(outcome.providers, ["cpu"]);
   assert.equal(outcome.fallback?.from, "cuda");
   assert.match(outcome.fallback?.reason ?? "", /no device/);
-  assert.deepEqual(calls, [["cuda", "cpu"], ["cpu"]]);
+  assert.deepEqual(calls, [["cpu"]]);
   assert.ok(logs.some((line) => line.includes("falling back to the CPU execution provider")));
 });
 
-test("loadEngine uses cuda directly when the session opens", async () => {
+test("loadEngine never claims cuda when the GPU probe fails, even if the loader would succeed", async () => {
   const calls: string[][] = [];
-  const load = async (options: LayaOptions): Promise<Laya> => {
-    calls.push(names(options));
-    return fakeLaya(names(options));
-  };
+  const outcome = await loadEngine({
+    modelDir: "/models/laya/base-fp16",
+    cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
+    load: collectLoader(calls),
+    probe: async () => ({ available: false, reason: "CUDA driver version is insufficient" }),
+    weightsBytes: () => 800_000_000,
+    log: () => undefined,
+  });
+  assert.equal(outcome.device, "cpu");
+  assert.deepEqual(outcome.providers, ["cpu"]);
+  assert.deepEqual(calls, [["cpu"]]);
+  assert.match(outcome.fallback?.reason ?? "", /insufficient/);
+});
+
+test("loadEngine uses cuda directly when the probe verifies the provider stack", async () => {
+  const calls: string[][] = [];
   const outcome = await loadEngine({
     modelDir: "/does/not/exist",
     cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda" }),
-    load,
+    load: collectLoader(calls),
+    probe: async () => ({ available: true, reason: null }),
     log: () => undefined,
   });
   assert.equal(outcome.device, "cuda");
@@ -157,20 +236,38 @@ test("loadEngine uses cuda directly when the session opens", async () => {
   assert.deepEqual(calls, [["cuda", "cpu"]]);
 });
 
-test("loadEngine with LAYA_SERVE_DEVICE=cpu never attempts cuda", async () => {
+test("loadEngine with LAYA_SERVE_DEVICE=cpu never probes or attempts cuda", async () => {
   const calls: string[][] = [];
-  const load = async (options: LayaOptions): Promise<Laya> => {
-    calls.push(names(options));
-    return fakeLaya(names(options));
-  };
+  let probes = 0;
   const outcome = await loadEngine({
     modelDir: "/does/not/exist",
     cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cpu" }),
-    load,
+    load: collectLoader(calls),
+    probe: async () => {
+      probes += 1;
+      return { available: true, reason: null };
+    },
     log: () => undefined,
   });
   assert.equal(outcome.device, "cpu");
   assert.deepEqual(calls, [["cpu"]]);
+  assert.equal(probes, 0);
+});
+
+test("loadEngine falls back to cpu from an explicit TensorRT provider list", async () => {
+  const calls: string[][] = [];
+  const outcome = await loadEngine({
+    modelDir: "/models/laya/base-fp8",
+    cfg: loadDeviceConfig({ LAYA_SERVE_PROVIDERS: "tensorrt,cuda,cpu" }),
+    load: collectLoader(calls),
+    probe: async () => ({ available: false, reason: "libnvinfer.so.10: cannot open shared object file" }),
+    weightsBytes: () => 500_000_000,
+    log: () => undefined,
+  });
+  assert.equal(outcome.device, "cpu");
+  assert.deepEqual(calls, [["cpu"]]);
+  assert.equal(outcome.fallback?.from, "cuda");
+  assert.match(outcome.fallback?.reason ?? "", /libnvinfer/);
 });
 
 test("warmupEngine runs one dummy inference and never throws", async () => {
@@ -192,6 +289,12 @@ test("warmupEngine runs one dummy inference and never throws", async () => {
   const logs: string[] = [];
   assert.equal(await warmupEngine(broken, (message) => logs.push(message)), false);
   assert.ok(logs.some((line) => line.includes("warm-up inference failed")));
+});
+
+test("probeProviders verifies the cpu stack on the tiny fixture (offline)", async () => {
+  const result = await probeProviders(["cpu"]);
+  assert.equal(result.available, true);
+  assert.equal(result.reason, null);
 });
 
 test("probeCuda opens a GPU session when CUDA is present, else skips", async (t) => {

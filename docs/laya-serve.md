@@ -18,9 +18,11 @@ only **serves and logs**; it never learns online.
   expense. The execution provider is chosen by `LAYA_SERVE_DEVICE` (`cuda` by
   default, `cpu` to opt out). The CPU fallback is mandatory: a missing GPU, an
   insufficient driver, or a CUDA init failure is logged and the session opens on
-  CPU instead of crashing. fp32 (~1.6 GiB of weights) cannot meet the ceiling —
-  fp32 stays on CPU; only a quantized (nvfp4/fp8/fp16) variant may run on CUDA,
-  and only after its measured total GPU delta is ≤ 2048 MiB.
+  CPU instead of crashing. fp32 (~1.6 GiB of weights) cannot meet the ceiling, so
+  the fp32 default bundle and any oversized bundle are **forced to CPU before any
+  GPU attempt** (`gpuCeilingViolation`); only a small quantized (nvfp4/fp8/fp16)
+  variant may run on CUDA, and only after its measured total GPU delta is
+  ≤ 2048 MiB.
 - **No unrequested egress.** The decision route loads the model from a local
   directory (`Laya.load({ modelDir })`), never the network. The only outbound
   call in the process is the tap forwarding a caller's request to the
@@ -48,20 +50,27 @@ llama-server, subject to two non-negotiables:
    1.22's CUDA bridge only forwards `deviceId`; `gpu_mem_limit` and
    `arena_extend_strategy: kSameAsRequested` are recorded in the provider config
    (`src/serve/device.ts`) but are **not honoured by the binding**, so the
-   ceiling is met by model size and verified by measuring the total GPU delta,
-   not by trusting the option. fp32 on CUDA adds ≈ 2337 MiB before any inference
-   and therefore must stay on CPU; only a small quantized variant
+   ceiling is enforced in code and verified by measuring the total GPU delta.
+   fp32 on CUDA adds ≈ 2337 MiB before any inference, so a bundle is refused on
+   the GPU before any session/probe when its directory name says `fp32` or its
+   `laya.onnx.data` is over 1 GiB (`gpuCeilingViolation`); the request is
+   downgraded to CPU and logged. Only a small quantized variant
    (nvfp4 / fp8 / fp16, ≈ 0.8 GiB) may be promoted to CUDA, and only after its
    measured total delta is ≤ 2048 MiB.
 2. **Never crowd out NInfer.** The provider list is `["cuda", "cpu"]`, so
-   unsupported nodes fall back per-node rather than failing the session. Startup
-   warms the session with one dummy inference so steady-state latency is not
-   paid by the first caller.
+   unsupported nodes fall back per-node rather than failing the session. Before
+   the real session opens, the exact provider stack is exercised on a 95-byte
+   Relu fixture (`probeProviders`); if it cannot initialize, the service logs and
+   starts on CPU, so `/health` never claims `cuda` for a stack that cannot run.
+   Startup then warms the session with one dummy inference so steady-state
+   latency is not paid by the first caller.
 
 `LAYA_SERVE_DEVICE=cuda` (default) attempts CUDA and falls back to CPU, logging
 the first line of the GPU error, when the driver, device, or provider library is
-unavailable. `LAYA_SERVE_DEVICE=cpu` skips CUDA entirely. For a quantized
-FP8/NVFP4 bundle, which the CUDA EP cannot execute, set
+unavailable. `LAYA_SERVE_DEVICE=cpu` skips CUDA entirely and **wins over**
+`LAYA_SERVE_PROVIDERS`; a GPU entry in the provider list together with
+`LAYA_SERVE_DEVICE=cpu` is rejected at startup rather than silently ignored. For
+a quantized FP8/NVFP4 bundle, which the CUDA EP cannot execute, set
 `LAYA_SERVE_PROVIDERS=tensorrt,cuda,cpu` (the TensorRT EP needs the matching
 `libnvinfer.so.*` on `LD_LIBRARY_PATH`); `cpu` stays last so a failed TensorRT/CUDA
 init still lands on CPU. `[N/A]` per-process VRAM accounting under WSL2 is
@@ -262,30 +271,30 @@ The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 
 ## Configuration
 
-| Env                             | Default                                         | Meaning                                 |
-| ------------------------------- | ----------------------------------------------- | --------------------------------------- |
-| `LAYA_SERVE_HOST`               | `127.0.0.1`                                     | loopback only; others are rejected      |
-| `LAYA_SERVE_PORT`               | `8790`                                          | listen port                             |
-| `LAYA_SERVE_MODEL_DIR`          | `/opt/auraforge/models/laya/base-fp32`          | ONNX bundle                             |
-| `LAYA_SERVE_MODEL_ID`           | derived (`laya-base-fp32`)                      | identity string                         |
-| `LAYA_SERVE_DEVICE`             | `cuda`                                          | `cuda` (CPU fallback) or `cpu`          |
-| `LAYA_SERVE_PROVIDERS`          | unset                                           | explicit EP list, e.g. `tensorrt,cuda,cpu` |
-| `LAYA_SERVE_GPU_MEM_MB`         | `2048`                                          | hard VRAM ceiling for the CUDA EP (MiB) |
-| `LAYA_SERVE_GPU_DEVICE_ID`      | `0`                                             | CUDA device ordinal                     |
-| `LAYA_SERVE_INTRA_OP_THREADS`   | unset (ORT default)                             | CPU intra-op threads                    |
-| `LAYA_SERVE_INTER_OP_THREADS`   | unset (ORT default)                             | CPU inter-op threads                    |
-| `LAYA_SERVE_SHADOW_LOG`         | `~/.auraforge-work/shadow/laya-decisions.jsonl` | JSONL path; empty disables              |
-| `LAYA_SERVE_HASH_WEIGHTS`       | `1`                                             | hash `laya.onnx.data` at startup        |
-| `LAYA_SERVE_REQUIRE_SHADOW`     | `0`                                             | fail startup when the log is unwritable |
-| `LAYA_SERVE_MAX_BODY_BYTES`     | `1048576`                                       | request body cap                        |
-| `LAYA_SERVE_MAX_QUESTIONS`      | `32`                                            | questions per request                   |
-| `LAYA_SERVE_JEV_ENABLED`        | `1`                                             | enable the Jev shadow tap               |
-| `LAYA_SERVE_JEV_UPSTREAM`       | `https://openrouter.ai/api/alpha/decisions`     | tap target; parsed, no embedded creds   |
-| `LAYA_SERVE_JEV_ALLOW_LOOPBACK` | `0`                                             | allow a loopback upstream (self-host)   |
-| `LAYA_SERVE_JEV_PAIRS_LOG`      | `~/.auraforge-work/shadow/jev-laya-pairs.jsonl` | joined record; empty disables           |
-| `LAYA_SERVE_JEV_SECRETS`        | `~/.config/auraforge/secrets.env`               | file searched for the key               |
-| `LAYA_SERVE_JEV_TIMEOUT_MS`     | `60000`                                         | upstream forward timeout                |
-| `LAYA_SERVE_JEV_QUEUE_MAX`      | `256`                                           | queued Laya shadows before `QUEUE_FULL` |
+| Env                             | Default                                         | Meaning                                                                           |
+| ------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------- |
+| `LAYA_SERVE_HOST`               | `127.0.0.1`                                     | loopback only; others are rejected                                                |
+| `LAYA_SERVE_PORT`               | `8790`                                          | listen port                                                                       |
+| `LAYA_SERVE_MODEL_DIR`          | `/opt/auraforge/models/laya/base-fp32`          | ONNX bundle                                                                       |
+| `LAYA_SERVE_MODEL_ID`           | derived (`laya-base-fp32`)                      | identity string                                                                   |
+| `LAYA_SERVE_DEVICE`             | `cuda`                                          | `cuda` (CPU fallback) or `cpu`                                                    |
+| `LAYA_SERVE_PROVIDERS`          | unset                                           | explicit EP list, e.g. `tensorrt,cuda,cpu`; rejected with `LAYA_SERVE_DEVICE=cpu` |
+| `LAYA_SERVE_GPU_MEM_MB`         | `2048`                                          | hard VRAM ceiling for the CUDA EP (MiB)                                           |
+| `LAYA_SERVE_GPU_DEVICE_ID`      | `0`                                             | CUDA device ordinal                                                               |
+| `LAYA_SERVE_INTRA_OP_THREADS`   | unset (ORT default)                             | CPU intra-op threads                                                              |
+| `LAYA_SERVE_INTER_OP_THREADS`   | unset (ORT default)                             | CPU inter-op threads                                                              |
+| `LAYA_SERVE_SHADOW_LOG`         | `~/.auraforge-work/shadow/laya-decisions.jsonl` | JSONL path; empty disables                                                        |
+| `LAYA_SERVE_HASH_WEIGHTS`       | `1`                                             | hash `laya.onnx.data` at startup                                                  |
+| `LAYA_SERVE_REQUIRE_SHADOW`     | `0`                                             | fail startup when the log is unwritable                                           |
+| `LAYA_SERVE_MAX_BODY_BYTES`     | `1048576`                                       | request body cap                                                                  |
+| `LAYA_SERVE_MAX_QUESTIONS`      | `32`                                            | questions per request                                                             |
+| `LAYA_SERVE_JEV_ENABLED`        | `1`                                             | enable the Jev shadow tap                                                         |
+| `LAYA_SERVE_JEV_UPSTREAM`       | `https://openrouter.ai/api/alpha/decisions`     | tap target; parsed, no embedded creds                                             |
+| `LAYA_SERVE_JEV_ALLOW_LOOPBACK` | `0`                                             | allow a loopback upstream (self-host)                                             |
+| `LAYA_SERVE_JEV_PAIRS_LOG`      | `~/.auraforge-work/shadow/jev-laya-pairs.jsonl` | joined record; empty disables                                                     |
+| `LAYA_SERVE_JEV_SECRETS`        | `~/.config/auraforge/secrets.env`               | file searched for the key                                                         |
+| `LAYA_SERVE_JEV_TIMEOUT_MS`     | `60000`                                         | upstream forward timeout                                                          |
+| `LAYA_SERVE_JEV_QUEUE_MAX`      | `256`                                           | queued Laya shadows before `QUEUE_FULL`                                           |
 
 The upstream must be a valid `http(s)` URL without embedded credentials. Loopback
 is rejected unless `LAYA_SERVE_JEV_ALLOW_LOOPBACK=1`, and link-local/metadata/
@@ -377,21 +386,27 @@ bundle before enabling CUDA.
 ## Tests
 
 ```sh
-./node_modules/.bin/tsx --test test/test_serve_protocol.ts test/test_serve_device.ts test/test_serve_shadow.ts test/test_serve_http.ts
+./node_modules/.bin/tsx --test test/test_serve_protocol.ts test/test_serve_device.ts test/test_serve_shadow.ts test/test_serve_http.ts test/test_serve_parity.ts
 # or: yarn test:serve
 ```
 
 Covers request validation and limits, response shape/identity,
 `canonicalJson`/request hashing, the shadow-line format and its no-raw-text
-property, HTTP status codes, the engine-failure path, and the device policy
-(env parsing, provider construction, CUDA→CPU fallback). The CUDA probe test
-skips cleanly when no GPU/CUDA driver is reachable.
+property, HTTP status codes, the engine-failure path, the device policy (env
+parsing, provider construction, the 2048 MiB ceiling gate, GPU-probe-gated
+CUDA→CPU fallback, the `cpu`-wins rule) and the fail-closed parity comparison.
+The CUDA probe test skips cleanly when no GPU/CUDA driver is reachable; the
+`probeProviders(["cpu"])` test always runs offline.
 
 ### Answer parity
 
 `scripts/quantize-laya.py` also runs each produced variant and the fp32 baseline
 on the repo test fixtures and reports the maximum absolute difference of `noul`
-(and of each score level/choice probability). A variant is only eligible for
+(and of each score level/choice probability). The comparison **fails closed**:
+`scripts/check-parity.ts` exits 3 with `ok:false` when the variant returns an
+empty answer set or a key set that differs from the baseline, so a corrupt model
+can never be reported as a zero-difference pass (exit 2 means the variant could
+not load with the requested providers). A variant is only eligible for
 `LAYA_SERVE_DEVICE=cuda` once the parity number is recorded; fp32 stays the
 default until then.
 

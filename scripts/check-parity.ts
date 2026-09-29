@@ -4,39 +4,32 @@
  *
  * Loads the fp32 baseline and one candidate variant (nvfp4/fp8/fp16) and runs
  * both on the repo test fixtures, then reports the maximum absolute difference
- * of `noul`, of every probability, and of every score. Exit code 2 when the
- * variant cannot be loaded with the requested providers (for example the
- * TensorRT EP without libnvinfer), so a caller can fall back.
+ * of `noul`, of every probability, and of every score.
+ *
+ * Exit codes are fail-closed:
+ *   0  parity measured, answer key sets identical
+ *   2  the variant could not be loaded with the requested providers
+ *   3  the variant answers are empty or their key set differs from the baseline
+ *      (the check must never pass a non-functional/corrupt model as 0-diff)
  *
  *   ./node_modules/.bin/tsx scripts/check-parity.ts \
  *     --baseline /opt/auraforge/models/laya/base-fp32 \
  *     --variant ~/models/laya/base-fp8 --providers tensorrt,cuda,cpu
  */
 import { Laya } from "../src/laya.js";
-import type { Answer, Question, SystemOneResult } from "../src/types.js";
 import { FIXTURES } from "./fixtures.js";
+import { compareMetricKeys, metrics } from "./parity.js";
 
 function arg(name: string): string | undefined {
   const index = process.argv.indexOf(name);
   return index >= 0 ? process.argv[index + 1] : undefined;
 }
 
-/** flatten an answer set into comparable numeric metrics */
-function metrics(result: SystemOneResult<Record<string, Question>>): Record<string, number> {
-  const out: Record<string, number> = {};
-  for (const [qid, answer] of Object.entries(result.answers as Record<string, Answer>)) {
-    if (answer.type === "noul") {
-      out[`${qid}.noul`] = answer.noul;
-    } else if (answer.type === "choice") {
-      for (const [key, value] of Object.entries(answer.probabilities)) out[`${qid}.p.${key}`] = value;
-      out[`${qid}.confidence`] = answer.confidence;
-    } else {
-      for (const [key, value] of Object.entries(answer.probabilities)) out[`${qid}.p.${key}`] = value;
-      out[`${qid}.score`] = answer.score;
-      out[`${qid}.confidence`] = answer.confidence;
-    }
+/** Terminal parity failure: the caller must not read a diff out of this run. */
+class ParityError extends Error {
+  constructor(readonly payload: Record<string, unknown>) {
+    super(String(payload.reason));
   }
-  return out;
 }
 
 async function main(): Promise<void> {
@@ -66,13 +59,24 @@ async function main(): Promise<void> {
   let maxProbability = 0;
   try {
     for (const fixture of FIXTURES) {
-      const a = metrics(await baseline.systemOne(fixture.state, fixture.questions));
-      const b = metrics(await variant.systemOne(fixture.state, fixture.questions));
+      const baselineMetrics = metrics(await baseline.systemOne(fixture.state, fixture.questions));
+      const variantMetrics = metrics(await variant.systemOne(fixture.state, fixture.questions));
+      const keys = compareMetricKeys(baselineMetrics, variantMetrics);
+      if (!keys.ok) {
+        throw new ParityError({
+          ok: false,
+          variant: variantDir,
+          providers,
+          fixture: fixture.name,
+          reason: keys.reason,
+          missing_in_variant: keys.missing_in_variant,
+          missing_in_baseline: keys.missing_in_baseline,
+        });
+      }
       let caseMax = 0;
       let caseKey: string | null = null;
-      for (const key of Object.keys(a)) {
-        if (!(key in b)) continue;
-        const delta = Math.abs((a[key] ?? 0) - (b[key] ?? 0));
+      for (const key of Object.keys(baselineMetrics)) {
+        const delta = Math.abs((baselineMetrics[key] ?? 0) - (variantMetrics[key] ?? 0));
         diffs[key] = delta;
         if (key.endsWith(".noul")) maxNoul = Math.max(maxNoul, delta);
         else if (key.includes(".p.")) maxProbability = Math.max(maxProbability, delta);
@@ -83,6 +87,13 @@ async function main(): Promise<void> {
       }
       perCase.push({ fixture: fixture.name, max_abs_diff: caseMax, max_key: caseKey });
     }
+  } catch (error) {
+    if (error instanceof ParityError) {
+      process.stdout.write(`${JSON.stringify(error.payload, null, 2)}\n`);
+      process.exitCode = 3;
+      return;
+    }
+    throw error;
   } finally {
     await baseline.close();
     await variant.close();

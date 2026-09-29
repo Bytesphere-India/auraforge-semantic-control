@@ -61,14 +61,19 @@ def log(message: str) -> None:
     sys.stderr.write(f"quantize-laya: {message}\n")
 
 
+def validate_venv(venv: Path) -> None:
+    """Only the dedicated venv may ever receive pip packages (brief containment)."""
+    if venv.expanduser().resolve() != DEFAULT_VENV.expanduser().resolve():
+        raise SystemExit(f"quantize-laya: refusing --venv {venv}; packages may only be installed into {DEFAULT_VENV}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--src", type=Path, default=DEFAULT_SRC, help=f"fp32 bundle to read (default: {DEFAULT_SRC})")
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT, help=f"output root (default: {DEFAULT_OUT_ROOT})")
     parser.add_argument("--variant", choices=("auto",) + VARIANTS, default="auto", help="force one variant instead of trying in order")
-    parser.add_argument("--venv", type=Path, default=DEFAULT_VENV, help=f"dedicated venv (default: {DEFAULT_VENV})")
+    parser.add_argument("--venv", type=Path, default=DEFAULT_VENV, help=f"dedicated venv; must be {DEFAULT_VENV}")
     parser.add_argument("--skip-install", action="store_true", help="do not pip install into the venv")
-    parser.add_argument("--no-venv", action="store_true", help="run in the current interpreter (advanced)")
     parser.add_argument("--trt-package", default=DEFAULT_TRT_PACKAGE, help=f"TensorRT wheel to install (default: {DEFAULT_TRT_PACKAGE})")
     parser.add_argument("--no-parity", action="store_true", help="skip the onnxruntime-node parity check")
     parser.add_argument(
@@ -76,7 +81,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="report what this host can do (GPU, TensorRT libs, venv writability) and exit without installing",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    validate_venv(args.venv)
+    return args
 
 
 def _module_available(name: str) -> bool:
@@ -153,7 +160,7 @@ def ensure_venv(args: argparse.Namespace) -> None:
 
 def reexec_in_venv(args: argparse.Namespace) -> None:
     """Re-exec the script with the venv interpreter (the modules live there)."""
-    if args.no_venv or os.environ.get("_LAYA_QUANT_VENV") == "1":
+    if os.environ.get("_LAYA_QUANT_VENV") == "1":
         return
     python = args.venv / "bin" / "python"
     if not python.exists():
@@ -167,7 +174,7 @@ def guard_paths(src: Path, out_root: Path) -> None:
     out_root = out_root.resolve()
     if not (src / "laya.onnx").exists():
         raise SystemExit(f"quantize-laya: no laya.onnx under {src}")
-    protected = Path("/opt/auraforge/models/laya")
+    protected = Path("/opt/auraforge/models/laya").resolve()
     if out_root == protected or protected in out_root.parents:
         raise SystemExit(f"quantize-laya: refusing to write under the protected model root {protected}")
     if out_root == src or src in out_root.parents:
@@ -314,6 +321,14 @@ def run_parity(baseline: Path, variant_dir: Path) -> dict[str, object]:
                 last = {"ok": False, "providers": providers, "reason": result.stdout[-2000:] or result.stderr[-2000:]}
             last["attempted_providers"] = providers
             continue
+        if result.returncode == 3:
+            # Fail-closed parity (empty/missing answers): terminal, not a provider problem.
+            try:
+                last = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                last = {"ok": False, "providers": providers, "reason": result.stdout[-2000:] or result.stderr[-2000:]}
+            last["attempted_providers"] = providers
+            return last
         last = {"ok": False, "providers": providers, "reason": result.stderr[-2000:] or result.stdout[-2000:]}
     return last
 
@@ -351,10 +366,10 @@ def main() -> int:
     args = parse_args()
     if args.check:
         return check_environment(args)
-    if not args.no_venv:
-        ensure_venv(args)
-        reexec_in_venv(args)
+    # Validate every write target before creating a venv or installing anything.
     guard_paths(args.src, args.out_root)
+    ensure_venv(args)
+    reexec_in_venv(args)
 
     out_root = args.out_root.resolve()
     out_root.mkdir(parents=True, exist_ok=True)

@@ -4,10 +4,11 @@ The authoritative service tests are TypeScript (`tsx --test`, wired into
 `package.json` `"test"` per the brief).  This module lets a pytest-based CI run
 the same impact-scoped serve/tap suite and asserts a positive pass count with
 zero failures, so the result is visible to whichever harness collected it.  It
-is impact-scoped: it runs the four `test_serve_*.ts` modules, not the full
-`yarn test` (which also covers model/download tests).  It does not reimplement,
-replace or weaken the TypeScript tests.  This file lives inside the project
-worktree (`<repo>/.dsh/tests/`), not in a shared or external location.
+is impact-scoped: it runs the `test_serve_*.ts` modules (protocol, device
+policy, shadow, HTTP, Jev tap, parity), not the full `yarn test` (which also
+covers model/download tests).  It does not reimplement, replace or weaken the
+TypeScript tests.  This file lives inside the project worktree
+(`<repo>/.dsh/tests/`), not in a shared or external location.
 
 Fail-closed on every infrastructure problem: a missing `tsx`, a timeout, a
 non-zero exit, or a summary with no tests / no passes / any failure all fail the
@@ -25,12 +26,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TSX = REPO_ROOT / "node_modules" / ".bin" / "tsx"
 
 # The impact-scoped TypeScript modules that verify the `laya-serve` surface;
-# `test_serve_jev_tap.ts` is the tap suite.
+# `test_serve_jev_tap.ts` is the tap suite, `test_serve_device.ts` is the GPU
+# policy/ceiling suite and `test_serve_parity.ts` the fail-closed parity suite.
 SERVE_TEST_MODULES = (
     "test/test_serve_protocol.ts",
+    "test/test_serve_device.ts",
     "test/test_serve_shadow.ts",
     "test/test_serve_http.ts",
     "test/test_serve_jev_tap.ts",
+    "test/test_serve_parity.ts",
 )
 TIMEOUT_SECONDS = 900
 
