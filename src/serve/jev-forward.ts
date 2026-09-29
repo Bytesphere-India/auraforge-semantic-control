@@ -29,6 +29,28 @@ export interface JevForwardResult {
 
 export type JevTransport = (input: JevForwardInput) => Promise<JevForwardResult>;
 
+/**
+ * Parse and minimally validate an upstream URL: http(s) only, a non-empty
+ * hostname, and no embedded credentials. Address-class policy (loopback /
+ * link-local / metadata ranges) lives in `config.ts`, the service's env gate.
+ */
+export function parseJevUpstream(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`JEV upstream is not a valid URL: ${JSON.stringify(raw)}`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`JEV upstream must use http or https, got ${JSON.stringify(url.protocol)}`);
+  }
+  if (url.hostname.length === 0) throw new Error("JEV upstream must have a hostname");
+  if (url.username.length > 0 || url.password.length > 0) {
+    throw new Error("JEV upstream must not embed credentials");
+  }
+  return url;
+}
+
 /** Default transport: Node's global fetch with an abort-based timeout. */
 export const fetchJevTransport: JevTransport = async (input) => {
   const started = performance.now();

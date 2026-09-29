@@ -46,23 +46,45 @@ export function secretFingerprint(secret: string): string {
   return createHash("sha256").update(secret).digest("hex").slice(0, 12);
 }
 
-/** Replace every occurrence of the key with a placeholder. */
+/**
+ * Scrub a string for persistence: the host key is replaced, and generic
+ * `Bearer`/`Basic` credentials plus `authorization:`/`api_key=` assignments are
+ * redacted even when no host key is known, so a caller-supplied credential can
+ * never reach a shadow record. The token branch requires a plausible credential
+ * shape (length >= 8 and at least one digit/symbol) to avoid mangling ordinary
+ * prose such as "basic authentication".
+ */
 export function redactSecret(text: string, secret: string | null): string {
-  if (secret === null || secret.length === 0) return text;
-  return text.split(secret).join("[REDACTED]");
+  let out = text;
+  if (secret !== null && secret.length > 0) out = out.split(secret).join("[REDACTED]");
+  // a value that *is* an auth header is a credential regardless of token shape
+  if (/^\s*(?:bearer|basic)\s+\S+/i.test(out)) return "[REDACTED]";
+  return (
+    out
+      .replace(/\b(?:bearer|basic)\s+([-a-z0-9._~+/=]+)/gi, (match, token: string) => (token.length >= 8 && /[-0-9._~+/=]/.test(token) ? "[REDACTED]" : match))
+      // header- and assignment-style credentials, including inside a non-JSON body
+      .replace(/((?:authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret))\s*[:=]\s*[^\r\n,}]*/gi, "$1=[REDACTED]")
+  );
 }
 
-const SENSITIVE_KEY = /(authorization|api[_-]?key|access[_-]?token|secret)/i;
+const SENSITIVE_KEY = /(authorization|proxy-authorization|api[_-]?key|access[_-]?token|secret)/i;
+const UNSAFE_KEY = /^(?:__proto__|prototype|constructor)$/;
 
-/** Deep-copy a JSON value for persistence, dropping credential fields and redacting the key. */
+/**
+ * Deep-copy a JSON value for persistence. Credential-named fields are removed
+ * entirely (not replaced), prototype-polluting keys are ignored, and string
+ * values are scrubbed. Uses a null-prototype object so a `__proto__` key can
+ * never mutate the prototype of the stored object.
+ */
 export function sanitizeForStorage(value: unknown, secret: string | null, depth = 0): unknown {
   if (depth > 32) return "[depth-limit]";
   if (typeof value === "string") return redactSecret(value, secret);
   if (Array.isArray(value)) return value.map((item) => sanitizeForStorage(item, secret, depth + 1));
   if (value !== null && typeof value === "object") {
-    const out: Record<string, unknown> = {};
+    const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      out[key] = SENSITIVE_KEY.test(key) ? "[redacted]" : sanitizeForStorage(item, secret, depth + 1);
+      if (UNSAFE_KEY.test(key) || SENSITIVE_KEY.test(key)) continue;
+      out[key] = sanitizeForStorage(item, secret, depth + 1);
     }
     return out;
   }

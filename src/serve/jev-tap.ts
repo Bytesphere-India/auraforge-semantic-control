@@ -10,14 +10,19 @@
  *      (no short timeout) and appends one joined record to
  *      `jev-laya-pairs.jsonl` with the payload, Jev's reply and Laya's reply.
  *
- * Laya is scheduled with `setImmediate`, i.e. after the response turn, and a
- * slow or failing Laya can never delay or fail the Jev response. The Jev key is
- * never logged or persisted.
+ * Dispatch is a *handoff*: `handle()` returns the response plus a `commit()`
+ * callback. The HTTP layer calls `commit()` only from the response `finish`/
+ * `close` events, so the shadow is scheduled strictly after the response is on
+ * the wire and `drain()` can account for an in-flight handoff during shutdown.
+ * A slow or failing Laya can never delay or fail the Jev response.
+ *
+ * The tap fails closed when no host key is configured: it refuses to forward and
+ * returns `503 JEV_KEY_MISSING`. The key is never logged or persisted.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { redactSecret, sanitizeForStorage, secretFingerprint } from "./jev-key.js";
-import type { JevForwardResult, JevTransport } from "./jev-forward.js";
-import { computeRequestHash, validateDecisionRequest, type ServeLimits, type ValidatedDecisionRequest } from "./protocol.js";
+import { parseJevUpstream, type JevForwardResult, type JevTransport } from "./jev-forward.js";
+import { computeRequestHash, validateDecisionRequest, type ServeLimits, type ValidationResult } from "./protocol.js";
 import { recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
 import type { DecisionEngine, EngineIdentity } from "./types.js";
 
@@ -44,10 +49,18 @@ export interface TapResponse {
   body: string;
 }
 
+/**
+ * The response plus the deferred shadow dispatch. `commit()` is idempotent and
+ * must be called once the response has finished (or its connection closed).
+ */
+export interface TapHandoff extends TapResponse {
+  commit: () => void;
+}
+
 export interface JevTap {
-  handle(body: string, caller: string | null, contentType: string): Promise<TapResponse>;
+  handle(body: string, caller: string | null, contentType: string): Promise<TapHandoff>;
   stats(): JevTapStats;
-  /** resolves when every queued Laya shadow has finished */
+  /** resolves when every queued Laya shadow and every uncommitted handoff is settled */
   drain(): Promise<void>;
 }
 
@@ -77,7 +90,7 @@ interface ShadowArgs {
   parsed: unknown;
   payloadSha: string;
   requestHash: string;
-  validation: ValidatedDecisionRequest | { ok: false; code: string } | null;
+  validation: ValidationResult | null;
   forward: JevForwardResult;
 }
 
@@ -128,13 +141,41 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
+/** Synthesized upstream view when the tap refuses to forward (no host key). */
+function keyMissingForward(): JevForwardResult {
+  return {
+    status: 503,
+    contentType: "application/json; charset=utf-8",
+    body: JSON.stringify({ error: "jev key is not configured", code: "JEV_KEY_MISSING" }),
+    latencyMs: 0,
+    error: "JEV_KEY_MISSING",
+  };
+}
+
 export function createJevTap(options: JevTapOptions): JevTap {
+  const upstreamUrl = parseJevUpstream(options.upstreamUrl).toString();
   const now = options.now ?? (() => performance.now());
   const clock = options.clock ?? (() => new Date());
   const newId = options.newId ?? (() => randomUUID());
   const queueMax = options.queueMax ?? 256;
   const queue = new SerialQueue(queueMax);
   const counters = { calls: 0, forwarded_ok: 0, forwarded_error: 0, shadows_ok: 0, shadows_error: 0, last_error: null as string | null };
+
+  // In-flight handoffs between `handle()` returning and `commit()` being called.
+  let handoffs = 0;
+  let handoffWaiters: Array<() => void> = [];
+  const handoffStart = (): void => {
+    handoffs += 1;
+  };
+  const handoffDone = (): void => {
+    if (handoffs > 0) handoffs -= 1;
+    if (handoffs === 0) {
+      const waiters = handoffWaiters;
+      handoffWaiters = [];
+      for (const wait of waiters) wait();
+    }
+  };
+  const waitForHandoffs = (): Promise<void> => (handoffs === 0 ? Promise.resolve() : new Promise<void>((resolve) => handoffWaiters.push(resolve)));
 
   const writePair = (args: ShadowArgs, laya: JevLayaPairLaya): void => {
     const replyParsed = parseJson(args.forward.body);
@@ -146,11 +187,11 @@ export function createJevTap(options: JevTapOptions): JevTap {
       ts: clock().toISOString(),
       received_at: args.receivedAt,
       request_id: args.requestId,
-      caller: args.caller,
+      caller: args.caller === null ? null : redactSecret(args.caller, options.apiKey),
       request_hash: args.requestHash,
       payload_sha256: args.payloadSha,
       request: args.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(args.parsed, options.apiKey),
-      forwarded: { url: options.upstreamUrl, content_type: args.contentType },
+      forwarded: { url: upstreamUrl, content_type: args.contentType },
       jev: {
         status: args.forward.status,
         ok: args.forward.error === null && args.forward.status >= 200 && args.forward.status < 300,
@@ -180,6 +221,13 @@ export function createJevTap(options: JevTapOptions): JevTap {
 
   const runShadow = async (args: ShadowArgs): Promise<void> => {
     const started = now();
+    if (args.forward.error === "JEV_KEY_MISSING") {
+      // Fail closed: the call was refused, so Laya must not run either.
+      counters.shadows_error += 1;
+      counters.last_error = "JEV_KEY_MISSING";
+      writePair(args, errorLaya(started, "JEV_KEY_MISSING"));
+      return;
+    }
     if (args.validation === null) {
       counters.shadows_error += 1;
       counters.last_error = "INVALID_JSON";
@@ -212,7 +260,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
         latency_ms: Math.round(latencyMs),
         model: options.identity.model,
         model_sha256: options.identity.modelSha256,
-        answers: result.answers,
+        answers: sanitizeForStorage(result.answers, options.apiKey) as JevLayaPairLaya["answers"],
         usage: result.usage,
         error: null,
       });
@@ -233,7 +281,23 @@ export function createJevTap(options: JevTapOptions): JevTap {
     }
   };
 
-  const handle = async (body: string, caller: string | null, contentType: string): Promise<TapResponse> => {
+  const makeHandoff = (args: ShadowArgs): TapHandoff => {
+    handoffStart();
+    let committed = false;
+    const commit = (): void => {
+      if (committed) return;
+      committed = true;
+      if (!queue.push(() => runShadow(args))) {
+        counters.shadows_error += 1;
+        counters.last_error = "QUEUE_FULL";
+        writePair(args, errorLaya(now(), "QUEUE_FULL"));
+      }
+      handoffDone();
+    };
+    return { status: args.forward.status, contentType: args.forward.contentType, body: args.forward.body, commit };
+  };
+
+  const handle = async (body: string, caller: string | null, contentType: string): Promise<TapHandoff> => {
     counters.calls += 1;
     const requestId = newId();
     const receivedAt = clock().toISOString();
@@ -241,48 +305,43 @@ export function createJevTap(options: JevTapOptions): JevTap {
     const payloadSha = sha256(body);
     const validation = parsed === undefined ? null : validateDecisionRequest(parsed, options.limits);
     const requestHash = validation !== null && validation.ok ? computeRequestHash(options.identity, validation.state, validation.questions) : payloadSha;
-
-    const forward = await options.transport({
-      url: options.upstreamUrl,
-      body,
-      contentType: contentType || "application/json",
-      apiKey: options.apiKey,
-      timeoutMs: options.timeoutMs,
-    });
-    if (forward.error === null) counters.forwarded_ok += 1;
-    else counters.forwarded_error += 1;
-
+    const effectiveContentType = contentType || "application/json";
     const args: ShadowArgs = {
       requestId,
       receivedAt,
       caller,
-      contentType: contentType || "application/json",
+      contentType: effectiveContentType,
       body,
       parsed,
       payloadSha,
       requestHash,
       validation,
-      forward,
+      forward: keyMissingForward(),
     };
 
-    // Schedule the Laya shadow after this turn so the Jev response is on the
-    // wire first; the shadow never participates in the response path.
-    setImmediate(() => {
-      if (!queue.push(() => runShadow(args))) {
-        counters.shadows_error += 1;
-        counters.last_error = "QUEUE_FULL";
-        writePair(args, errorLaya(now(), "QUEUE_FULL"));
-      }
-    });
+    if (options.apiKey === null) {
+      counters.forwarded_error += 1;
+      counters.last_error = "JEV_KEY_MISSING";
+      return makeHandoff(args);
+    }
 
-    return { status: forward.status, contentType: forward.contentType, body: forward.body };
+    args.forward = await options.transport({
+      url: upstreamUrl,
+      body,
+      contentType: effectiveContentType,
+      apiKey: options.apiKey,
+      timeoutMs: options.timeoutMs,
+    });
+    if (args.forward.error === null) counters.forwarded_ok += 1;
+    else counters.forwarded_error += 1;
+    return makeHandoff(args);
   };
 
   return {
     handle,
     stats: () => ({
       enabled: true,
-      upstream: options.upstreamUrl,
+      upstream: upstreamUrl,
       key_present: options.apiKey !== null,
       key_fingerprint: options.apiKey !== null ? secretFingerprint(options.apiKey) : null,
       calls: counters.calls,
@@ -294,6 +353,9 @@ export function createJevTap(options: JevTapOptions): JevTap {
       queue_max: queueMax,
       last_error: counters.last_error,
     }),
-    drain: () => queue.idle(),
+    drain: async () => {
+      await waitForHandoffs();
+      await queue.idle();
+    },
   };
 }

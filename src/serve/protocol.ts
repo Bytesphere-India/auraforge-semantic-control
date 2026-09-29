@@ -33,6 +33,9 @@ export const DEFAULT_LIMITS: ServeLimits = {
   maxQuestionIdChars: 128,
 };
 
+/** Question ids that would mutate an object's prototype if used as keys. */
+const UNSAFE_QUESTION_ID = /^(?:__proto__|prototype|constructor)$/;
+
 export interface ValidationError {
   ok: false;
   /** HTTP status the caller should send */
@@ -178,10 +181,13 @@ export function validateDecisionRequest(body: unknown, limits: ServeLimits = DEF
   if (ids.length === 0) return fail(400, "MISSING_QUESTIONS", "`questions` must contain at least one question");
   if (ids.length > limits.maxQuestions) return fail(400, "TOO_MANY_QUESTIONS", `at most ${limits.maxQuestions} questions are allowed per request`);
 
-  const questions: Record<string, Question> = {};
+  const questions: Record<string, Question> = Object.create(null) as Record<string, Question>;
   for (const qid of ids) {
     if (qid.length === 0 || qid.length > limits.maxQuestionIdChars) {
       return fail(400, "INVALID_QUESTION", `question id must be 1..${limits.maxQuestionIdChars} characters`);
+    }
+    if (UNSAFE_QUESTION_ID.test(qid)) {
+      return fail(400, "INVALID_QUESTION", `question id ${JSON.stringify(qid)} is reserved`);
     }
     const question = checkQuestion(rawQuestions[qid], qid, limits);
     if (!question.ok) return question;

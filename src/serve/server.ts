@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Answer } from "../types.js";
-import type { JevTap, TapResponse } from "./jev-tap.js";
+import type { JevTap, TapHandoff } from "./jev-tap.js";
 import { buildDecisionResponse, computeRequestHash, validateDecisionRequest, type ServeLimits } from "./protocol.js";
 import { recordShadowAnswers, type ShadowLog } from "./shadow.js";
 import type { DecisionEngine, EngineIdentity, ErrorResponseBody } from "./types.js";
@@ -195,13 +195,19 @@ export function createServer(deps: ServerDeps): http.Server {
     const contentType = headerValue(req.headers["content-type"]) ?? "application/json";
     requests += 1;
 
-    let forwarded: TapResponse;
+    let forwarded: TapHandoff;
     try {
       forwarded = await tap.handle(body.text, caller, contentType);
     } catch {
       errors += 1;
       return sendError(res, 502, "JEV_TAP_ERROR", "the Jev shadow tap failed to forward the request");
     }
+    // Dispatch the Laya shadow only once the response is on the wire (or the
+    // connection closed), so a slow shadow never sits in the response path and
+    // `drain()` can see the in-flight handoff during shutdown. `commit` is
+    // idempotent, so registering both events is safe.
+    res.once("finish", forwarded.commit);
+    res.once("close", forwarded.commit);
     res.writeHead(forwarded.status, { "content-type": forwarded.contentType, "content-length": Buffer.byteLength(forwarded.body) });
     res.end(forwarded.body);
   };

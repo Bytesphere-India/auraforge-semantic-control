@@ -164,10 +164,12 @@ Jev to Laya without changing anything but the URL:
    and body unchanged and immediately. The only header it adds is the host-side
    `Authorization`; a caller-supplied one is never forwarded. Callers send no
    key. The caller id comes from the `X-Caller` request header.
-2. **Shadow after the reply.** Once the response is on the wire, the same
-   payload runs through Laya on a serial queue (no short timeout; overflow is
-   reported, not dropped). A slow or failing Laya can never delay or fail the
-   Jev response.
+2. **Shadow after the reply.** Dispatch is a handoff: the server commits it only
+   from the response `finish`/`close` event, so the shadow is scheduled strictly
+   after the response is on the wire (and `drain()` can see the in-flight handoff
+   during shutdown). The payload then runs through Laya on a serial queue (no
+   short timeout; overflow is reported, not dropped). A slow or failing Laya can
+   never delay or fail the Jev response.
 3. **One joined record per call** (`jev-laya-pairs.jsonl`): the full request
    payload, Jev's full reply (status, answer, probabilities, usage/cost,
    latency), Laya's full reply (answers, probabilities, latency, model sha),
@@ -177,32 +179,45 @@ Jev to Laya without changing anything but the URL:
 4. **Key handling.** `OPENROUTER_JEV_API_KEY` is read from the service
    environment or `~/.config/auraforge/secrets.env` inside the process and is
    only ever placed in the outbound `Authorization` header. It is never logged,
-   printed, returned, or persisted; `sanitizeForStorage` drops credential fields
-   and redacts the key from everything written. `/health` exposes only a
-   non-reversible fingerprint.
+   printed, returned, or persisted. **The service fails closed**: with the tap
+   enabled and no key it refuses to start, and a tap constructed without a key
+   returns `503 JEV_KEY_MISSING` rather than forwarding unauthenticated calls.
+   `/health` exposes only a non-reversible fingerprint.
+5. **Credential scrubbing.** Credential-named fields (`authorization`,
+   `api_key`, ...) are _dropped_ (not replaced) and string values are scrubbed of
+   `Bearer`/`Basic` tokens and `authorization:`/`api_key=` assignments, including
+   in a non-JSON body; the `X-Caller` value is scrubbed the same way.
+   Prototype-polluting keys (`__proto__`, `constructor`, `prototype`) are ignored
+   and storage uses null-prototype objects.
 
 The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 `503 JEV_TAP_DISABLED`).
 
 ## Configuration
 
-| Env                         | Default                                         | Meaning                                 |
-| --------------------------- | ----------------------------------------------- | --------------------------------------- |
-| `LAYA_SERVE_HOST`           | `127.0.0.1`                                     | loopback only; others are rejected      |
-| `LAYA_SERVE_PORT`           | `8790`                                          | listen port                             |
-| `LAYA_SERVE_MODEL_DIR`      | `/opt/auraforge/models/laya/base-fp32`          | ONNX bundle                             |
-| `LAYA_SERVE_MODEL_ID`       | derived (`laya-base-fp32`)                      | identity string                         |
-| `LAYA_SERVE_SHADOW_LOG`     | `~/.auraforge-work/shadow/laya-decisions.jsonl` | JSONL path; empty disables              |
-| `LAYA_SERVE_HASH_WEIGHTS`   | `1`                                             | hash `laya.onnx.data` at startup        |
-| `LAYA_SERVE_REQUIRE_SHADOW` | `0`                                             | fail startup when the log is unwritable |
-| `LAYA_SERVE_MAX_BODY_BYTES` | `1048576`                                       | request body cap                        |
-| `LAYA_SERVE_MAX_QUESTIONS`  | `32`                                            | questions per request                   |
-| `LAYA_SERVE_JEV_ENABLED`    | `1`                                             | enable the Jev shadow tap               |
-| `LAYA_SERVE_JEV_UPSTREAM`   | `https://openrouter.ai/api/alpha/decisions`     | tap forward target (http(s))            |
-| `LAYA_SERVE_JEV_PAIRS_LOG`  | `~/.auraforge-work/shadow/jev-laya-pairs.jsonl` | joined record; empty disables           |
-| `LAYA_SERVE_JEV_SECRETS`    | `~/.config/auraforge/secrets.env`               | file searched for the key               |
-| `LAYA_SERVE_JEV_TIMEOUT_MS` | `60000`                                         | upstream forward timeout                |
-| `LAYA_SERVE_JEV_QUEUE_MAX`  | `256`                                           | queued Laya shadows before `QUEUE_FULL` |
+| Env                             | Default                                         | Meaning                                 |
+| ------------------------------- | ----------------------------------------------- | --------------------------------------- |
+| `LAYA_SERVE_HOST`               | `127.0.0.1`                                     | loopback only; others are rejected      |
+| `LAYA_SERVE_PORT`               | `8790`                                          | listen port                             |
+| `LAYA_SERVE_MODEL_DIR`          | `/opt/auraforge/models/laya/base-fp32`          | ONNX bundle                             |
+| `LAYA_SERVE_MODEL_ID`           | derived (`laya-base-fp32`)                      | identity string                         |
+| `LAYA_SERVE_SHADOW_LOG`         | `~/.auraforge-work/shadow/laya-decisions.jsonl` | JSONL path; empty disables              |
+| `LAYA_SERVE_HASH_WEIGHTS`       | `1`                                             | hash `laya.onnx.data` at startup        |
+| `LAYA_SERVE_REQUIRE_SHADOW`     | `0`                                             | fail startup when the log is unwritable |
+| `LAYA_SERVE_MAX_BODY_BYTES`     | `1048576`                                       | request body cap                        |
+| `LAYA_SERVE_MAX_QUESTIONS`      | `32`                                            | questions per request                   |
+| `LAYA_SERVE_JEV_ENABLED`        | `1`                                             | enable the Jev shadow tap               |
+| `LAYA_SERVE_JEV_UPSTREAM`       | `https://openrouter.ai/api/alpha/decisions`     | tap target; parsed, no embedded creds   |
+| `LAYA_SERVE_JEV_ALLOW_LOOPBACK` | `0`                                             | allow a loopback upstream (self-host)   |
+| `LAYA_SERVE_JEV_PAIRS_LOG`      | `~/.auraforge-work/shadow/jev-laya-pairs.jsonl` | joined record; empty disables           |
+| `LAYA_SERVE_JEV_SECRETS`        | `~/.config/auraforge/secrets.env`               | file searched for the key               |
+| `LAYA_SERVE_JEV_TIMEOUT_MS`     | `60000`                                         | upstream forward timeout                |
+| `LAYA_SERVE_JEV_QUEUE_MAX`      | `256`                                           | queued Laya shadows before `QUEUE_FULL` |
+
+The upstream must be a valid `http(s)` URL without embedded credentials. Loopback
+is rejected unless `LAYA_SERVE_JEV_ALLOW_LOOPBACK=1`, and link-local/metadata/
+reserved ranges (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`,
+`metadata.google.internal`, ...) are always rejected at startup.
 
 ## Run
 

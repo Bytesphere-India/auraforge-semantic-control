@@ -6,6 +6,7 @@
  */
 import os from "node:os";
 import path from "node:path";
+import { parseJevUpstream } from "./jev-forward.js";
 import { DEFAULT_LIMITS, type ServeLimits } from "./protocol.js";
 
 export const DEFAULT_MODEL_DIR = "/opt/auraforge/models/laya/base-fp32";
@@ -29,6 +30,8 @@ export interface JevTapConfig {
   timeoutMs: number;
   /** queued Laya shadows before overflow (overflow still writes a pair) */
   queueMax: number;
+  /** permit a loopback upstream (self-hosted Jev); off by default */
+  allowLoopback: boolean;
 }
 
 export interface ServeConfig {
@@ -82,6 +85,62 @@ export function deriveModelId(modelDir: string): string {
   return base.startsWith("laya") ? base : `laya-${base}`;
 }
 
+const JEV_BLOCKED_HOSTNAMES = new Set(["metadata.google.internal", "metadata.goog"]);
+
+function unbracket(hostname: string): string {
+  return hostname.replace(/^\[|\]$/g, "").toLowerCase();
+}
+
+/** loopback: 127.0.0.0/8, ::1 and localhost. */
+function isLoopbackHost(hostname: string): boolean {
+  const host = unbracket(hostname);
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host === "::1") return true;
+  return /^127\./.test(host);
+}
+
+/**
+ * Address classes the tap must never forward to, so an operator mistake cannot
+ * turn the tap into an SSRF primitive against cloud metadata or reserved space.
+ */
+function isBlockedJevHost(hostname: string): boolean {
+  const host = unbracket(hostname);
+  if (JEV_BLOCKED_HOSTNAMES.has(host)) return true;
+
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    const c = Number(v4[3]);
+    if (a === 0) return true; // this-network / unspecified
+    if (a === 169 && b === 254) return true; // link-local (cloud metadata)
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments
+    if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
+    if (a >= 224) return true; // multicast / reserved
+    return false;
+  }
+
+  if (host === "::") return true; // IPv6 unspecified
+  if (/^fe[89ab]/.test(host)) return true; // fe80::/10 link-local
+  if (host.startsWith("fc") || host.startsWith("fd")) return true; // fc00::/7 unique-local
+  return false;
+}
+
+/** Parse the upstream, enforce the address-class policy, and return it normalized. */
+export function resolveJevUpstream(raw: string, allowLoopback: boolean): string {
+  const url = parseJevUpstream(raw);
+  const host = url.hostname;
+  if (isLoopbackHost(host)) {
+    if (!allowLoopback) {
+      throw new Error(`LAYA_SERVE_JEV_UPSTREAM must not be loopback (${host}); set LAYA_SERVE_JEV_ALLOW_LOOPBACK=1 to allow a self-hosted Jev`);
+    }
+  } else if (isBlockedJevHost(host)) {
+    throw new Error(`LAYA_SERVE_JEV_UPSTREAM host ${host} is in a blocked link-local/metadata/reserved range`);
+  }
+  return url.toString();
+}
+
 export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConfig {
   const host = env.LAYA_SERVE_HOST || DEFAULT_HOST;
   if (!LOOPBACK.has(host)) {
@@ -91,10 +150,8 @@ export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConf
   const modelDir = path.resolve(expandHome(env.LAYA_SERVE_MODEL_DIR || DEFAULT_MODEL_DIR));
   const shadowRaw = env.LAYA_SERVE_SHADOW_LOG === undefined ? DEFAULT_SHADOW_LOG : env.LAYA_SERVE_SHADOW_LOG;
   const pairsRaw = env.LAYA_SERVE_JEV_PAIRS_LOG === undefined ? DEFAULT_JEV_PAIRS_LOG : env.LAYA_SERVE_JEV_PAIRS_LOG;
-  const upstreamUrl = env.LAYA_SERVE_JEV_UPSTREAM || DEFAULT_JEV_UPSTREAM;
-  if (!/^https?:\/\//.test(upstreamUrl)) {
-    throw new Error(`LAYA_SERVE_JEV_UPSTREAM must be an http(s) URL, got ${JSON.stringify(upstreamUrl)}`);
-  }
+  const allowLoopback = boolean(env, "LAYA_SERVE_JEV_ALLOW_LOOPBACK", false);
+  const upstreamUrl = resolveJevUpstream(env.LAYA_SERVE_JEV_UPSTREAM || DEFAULT_JEV_UPSTREAM, allowLoopback);
 
   return {
     host,
@@ -117,6 +174,7 @@ export function loadServeConfig(env: NodeJS.ProcessEnv = process.env): ServeConf
       secretsPath: path.resolve(expandHome(env.LAYA_SERVE_JEV_SECRETS || DEFAULT_JEV_SECRETS)),
       timeoutMs: positiveInt(env, "LAYA_SERVE_JEV_TIMEOUT_MS", 60_000, 300_000),
       queueMax: positiveInt(env, "LAYA_SERVE_JEV_QUEUE_MAX", 256, 1_000_000),
+      allowLoopback,
     },
   };
 }

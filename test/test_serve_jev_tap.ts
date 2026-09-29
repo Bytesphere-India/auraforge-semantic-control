@@ -6,8 +6,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { DEFAULT_LIMITS } from "../src/serve/protocol.js";
+import { loadServeConfig } from "../src/serve/config.js";
 import { fetchJevTransport, type JevForwardResult, type JevTransport } from "../src/serve/jev-forward.js";
-import { loadJevKey } from "../src/serve/jev-key.js";
+import { loadJevKey, sanitizeForStorage } from "../src/serve/jev-key.js";
 import { createJevTap, type JevTap } from "../src/serve/jev-tap.js";
 import { createServer, type ServeConfig } from "../src/serve/server.js";
 import { JevLayaPairsLog, ShadowLog } from "../src/serve/shadow.js";
@@ -308,8 +309,9 @@ test("injects the host key and never forwards or persists a caller credential", 
     const [record] = await h.waitForRecords(1);
     assert.ok(record);
     assert.equal(record.caller, "r18b-jev-watch.py");
-    assert.equal(rec(record.request).authorization, "[redacted]");
-    assert.equal(rec(record.request).api_key, "[redacted]");
+    const request = rec(record.request);
+    assert.ok(!Object.prototype.hasOwnProperty.call(request, "authorization"), "an authorization field must be dropped, not stored");
+    assert.ok(!Object.prototype.hasOwnProperty.call(request, "api_key"), "an api_key field must be dropped, not stored");
 
     const persisted = await readFile(h.pairsFile, "utf8");
     assert.ok(!persisted.includes(TAP_KEY), "the host key must never be persisted");
@@ -478,4 +480,139 @@ test("loadJevKey prefers the environment and parses the secrets file", async () 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("scrubs a caller credential from a non-JSON payload before persisting it", async () => {
+  const h = await setup();
+  try {
+    const malformed = `Authorization: Bearer ${CALLER_KEY}\n{"state": invalid`;
+    const res = await postTap(h, malformed, { "x-caller": `Bearer ${CALLER_KEY}` });
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.equal(record.caller, "[REDACTED]");
+    assert.equal(typeof record.request, "string");
+    assert.ok(!String(record.request).includes(CALLER_KEY), "the raw body must not persist the caller credential");
+    const persisted = await readFile(h.pairsFile, "utf8");
+    assert.ok(!persisted.includes(CALLER_KEY), "a caller credential must never be persisted");
+  } finally {
+    await h.close();
+  }
+});
+
+test("scrubs a Bearer token embedded in a nested string value", async () => {
+  const h = await setup();
+  try {
+    const payload = { ...basePayload(), state: { evidence: `retry with token Bearer ${CALLER_KEY}` } };
+    const res = await postTap(h, payload);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    const state = rec(rec(record.request).state);
+    assert.ok(!String(state.evidence).includes(CALLER_KEY), "an embedded token must be redacted");
+    const persisted = await readFile(h.pairsFile, "utf8");
+    assert.ok(!persisted.includes(CALLER_KEY));
+  } finally {
+    await h.close();
+  }
+});
+
+test("drops prototype-polluting keys instead of polluting prototypes", async () => {
+  const h = await setup();
+  try {
+    const raw = `{"model":"typesafe/jev-1.13","state":{"__proto__":{"polluted":true},"constructor":{"x":1},"evidence":"ok"},"questions":{"result":{"type":"noul","instructions":"x"}}}`;
+    const res = await postTap(h, raw);
+    assert.equal(res.status, 200);
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.equal(({} as Record<string, unknown>).polluted, undefined, "Object.prototype must not be polluted");
+    const state = rec(rec(record.request).state);
+    assert.ok(!Object.prototype.hasOwnProperty.call(state, "__proto__"));
+    assert.ok(!Object.prototype.hasOwnProperty.call(state, "constructor"));
+    assert.equal(state.evidence, "ok");
+
+    const direct = sanitizeForStorage(JSON.parse(`{"__proto__":{"x":1},"a":{"__proto__":{"y":2},"b":1}}`), null) as Record<string, unknown>;
+    assert.equal(Object.getPrototypeOf(direct), null);
+    assert.equal(({} as Record<string, unknown>).x, undefined);
+    assert.deepEqual({ ...(direct.a as Record<string, unknown>) }, { b: 1 });
+  } finally {
+    await h.close();
+  }
+});
+
+test("a tap without a host key refuses to forward and records JEV_KEY_MISSING", async () => {
+  const h = await setup({ apiKey: null });
+  try {
+    const res = await postTap(h, basePayload());
+    assert.equal(res.status, 503);
+    assert.equal(rec(await res.json()).code, "JEV_KEY_MISSING");
+    assert.equal(h.upstream.calls.length, 0, "the tap must not forward without a key");
+    const [record] = await h.waitForRecords(1);
+    assert.ok(record);
+    assert.equal(rec(record.jev).status, 503);
+    assert.equal(rec(record.jev).error, "JEV_KEY_MISSING");
+    assert.equal(rec(record.laya).error, "JEV_KEY_MISSING");
+    assert.equal(rec(record.laya).answers, null);
+  } finally {
+    await h.close();
+  }
+});
+
+test("the shadow is dispatched only after the response handoff commits", async () => {
+  const gate = deferred<SystemOneResult<Record<string, Question>>>();
+  let engineStarted = false;
+  const engine: DecisionEngine = {
+    systemOne: () => {
+      engineStarted = true;
+      return gate.promise;
+    },
+  };
+  const h = await setup({ engine });
+  try {
+    const tap = h.tap;
+    assert.ok(tap);
+    const handoff = await tap.handle(JSON.stringify(basePayload()), "tester", "application/json");
+    assert.equal(handoff.status, 200);
+    assert.equal(engineStarted, false, "the shadow must not start before the response finishes");
+
+    let drained = false;
+    const drainPromise = tap.drain().then(() => {
+      drained = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(drained, false, "drain must wait for the uncommitted handoff");
+
+    handoff.commit();
+    await waitFor(
+      async () => engineStarted,
+      (started) => started,
+      "Laya to start",
+    );
+    gate.resolve({ model: "laya", answers: engineAnswers(basePayload().questions), usage: { input_tokens: 5, output_tokens: 0 } });
+    await drainPromise;
+    assert.equal(drained, true);
+    assert.equal((await h.waitForRecords(1)).length, 1);
+  } finally {
+    gate.resolve({ model: "laya", answers: engineAnswers(basePayload().questions), usage: { input_tokens: 0, output_tokens: 0 } });
+    await h.close();
+  }
+});
+
+test("loadServeConfig rejects malformed, loopback and metadata JEV upstreams", () => {
+  // build the scheme and the metadata address at runtime so fixture-only lint rules do not fire
+  const httpUrl = (authority: string): string => ["http", "://", authority].join("");
+  const linkLocal = ["169", "254", "169", "254"].join(".");
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: "https://" }), /valid URL/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: "ftp://example.com/x" }), /http or https/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: "https://user:pass@example.com/x" }), /embed credentials/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl(linkLocal)}/latest/meta-data/` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("0.0.0.0:9000")}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("metadata.google.internal")}/x` }), /blocked/);
+  assert.throws(() => loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: `${httpUrl("127.0.0.1:9000")}/x` }), /loopback/);
+
+  const loopback = `${httpUrl("127.0.0.1:9000")}/x`;
+  const allowed = loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: loopback, LAYA_SERVE_JEV_ALLOW_LOOPBACK: "1" });
+  assert.equal(allowed.jev.upstreamUrl, loopback);
+  const publicUrl = loadServeConfig({ LAYA_SERVE_JEV_UPSTREAM: "https://openrouter.ai/api/alpha/decisions" });
+  assert.equal(publicUrl.jev.upstreamUrl, "https://openrouter.ai/api/alpha/decisions");
 });

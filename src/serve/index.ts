@@ -16,7 +16,7 @@ import path from "node:path";
 import { Laya } from "../laya.js";
 import { loadServeConfig, deriveModelId } from "./config.js";
 import { fetchJevTransport } from "./jev-forward.js";
-import { loadJevKey } from "./jev-key.js";
+import { JEV_KEY_ENV, loadJevKey } from "./jev-key.js";
 import { createJevTap } from "./jev-tap.js";
 import { createServer } from "./server.js";
 import { JevLayaPairsLog, ShadowLog } from "./shadow.js";
@@ -45,6 +45,16 @@ async function sha256File(file: string): Promise<string | null> {
 
 async function main(): Promise<void> {
   const config = loadServeConfig();
+
+  // Fail closed before loading anything: a tap without a host key would forward
+  // unauthenticated Jev calls (and disable key redaction), so refuse to start.
+  const jevKey = config.jev.enabled ? loadJevKey(process.env, config.jev.secretsPath) : null;
+  if (config.jev.enabled && jevKey === null) {
+    throw new Error(
+      `LAYA_SERVE_JEV_ENABLED=1 but ${JEV_KEY_ENV} is not set (in the environment or ${config.jev.secretsPath}); ` +
+        "refusing to start so the tap cannot forward unauthenticated calls. Set the key or LAYA_SERVE_JEV_ENABLED=0.",
+    );
+  }
 
   // Identity before the (slow) session load, so a bad bundle fails fast.
   const graphPath = path.join(config.modelDir, "laya.onnx");
@@ -84,7 +94,6 @@ async function main(): Promise<void> {
   if (config.requireShadow && config.jev.enabled && !pairsStats.writable) {
     throw new Error(`LAYA_SERVE_REQUIRE_SHADOW=1 but the Jev-Laya pairs log is not writable: ${pairsStats.path}`);
   }
-  const jevKey = config.jev.enabled ? loadJevKey(process.env, config.jev.secretsPath) : null;
   const jevTap = config.jev.enabled
     ? createJevTap({
         upstreamUrl: config.jev.upstreamUrl,
