@@ -3,9 +3,11 @@
  *
  * The tap is a transparent proxy: the caller's body is forwarded byte-for-byte
  * and the upstream status/headers/body are returned unchanged. Caller headers
- * (trace ids, idempotency keys, ...) are forwarded too, except hop-by-hop and
- * host-controlled ones; the only header the tap injects is the host-side
- * `Authorization`, and a caller-supplied `Authorization` is never forwarded.
+ * (trace ids, idempotency keys, accept, ...) are forwarded too, except hop-by-hop
+ * and transport-controlled ones; the tap keeps the caller's `Content-Type` and
+ * only defaults `Accept` to `application/json` when the caller sent none. The
+ * one header it injects is the host-side `Authorization`, and a caller-supplied
+ * `Authorization` is never forwarded.
  *
  * The transport is injectable so the whole tap is testable against a local fake
  * upstream with no external network.
@@ -73,6 +75,17 @@ export function forwardableResponseHeaders(headers: Headers): HeaderMap {
   return out;
 }
 
+/**
+ * Persist only the media type of a `content-type` value. MIME parameters are
+ * caller-controlled and can smuggle credentials (e.g.
+ * `application/json; api_key=...`), so they are dropped; anything that is not a
+ * clean `type/subtype` falls back to `application/json`.
+ */
+export function mediaType(value: string): string {
+  const bare = (value.split(";")[0] ?? "").trim().toLowerCase();
+  return /^[-a-z0-9!#$&^_.+]+\/[-a-z0-9!#$&^_.+]+$/.test(bare) ? bare : "application/json";
+}
+
 export interface JevForwardInput {
   url: string;
   /** exact request body bytes to forward */
@@ -126,8 +139,8 @@ export const fetchJevTransport: JevTransport = async (input) => {
   const headers: Record<string, string> = {
     ...input.headers,
     "content-type": input.contentType || "application/json",
-    accept: "application/json",
   };
+  if (!("accept" in headers)) headers.accept = "application/json";
   if (input.apiKey) headers.authorization = `Bearer ${input.apiKey}`;
 
   try {

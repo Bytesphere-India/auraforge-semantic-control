@@ -313,6 +313,7 @@ test("forwards caller headers and returns upstream response headers unchanged", 
     const res = await postTap(h, basePayload(), {
       "x-request-id": "trace-caller",
       "x-idempotency-key": "idem-1",
+      accept: "application/vnd.jev+json",
       authorization: `Bearer ${CALLER_KEY}`,
     });
     assert.equal(res.status, 200);
@@ -321,6 +322,7 @@ test("forwards caller headers and returns upstream response headers unchanged", 
     assert.ok(call);
     assert.equal(call.headers["x-request-id"], "trace-caller", "a caller trace header must be forwarded");
     assert.equal(call.headers["x-idempotency-key"], "idem-1", "a caller idempotency key must be forwarded");
+    assert.equal(call.headers.accept, "application/vnd.jev+json", "a caller Accept header must be forwarded, not clobbered");
     assert.equal(call.headers.authorization, `Bearer ${TAP_KEY}`, "the host key overrides any caller authorization");
 
     assert.equal(res.headers.get("x-ratelimit-remaining"), "42", "an upstream rate-limit header must be returned");
@@ -345,8 +347,8 @@ test("injects the host key and never forwards or persists a caller credential", 
     assert.ok(record);
     assert.equal(record.caller, "r18b-jev-watch.py");
     const request = rec(record.request);
-    assert.ok(!Object.prototype.hasOwnProperty.call(request, "authorization"), "an authorization field must be dropped, not stored");
-    assert.ok(!Object.prototype.hasOwnProperty.call(request, "api_key"), "an api_key field must be dropped, not stored");
+    assert.equal(request.authorization, "[REDACTED]", "an authorization field must be withheld, not stored");
+    assert.equal(request.api_key, "[REDACTED]", "an api_key field must be withheld, not stored");
 
     const persisted = await readFile(h.pairsFile, "utf8");
     assert.ok(!persisted.includes(TAP_KEY), "the host key must never be persisted");
@@ -746,23 +748,41 @@ test("the shadow is dispatched only after the response handoff commits", async (
   }
 });
 
-test("drops other credential-named fields while preserving usage token counts", async () => {
+test("keeps legitimate fields, withholds credentials, and marks what was redacted", async () => {
   const h = await setup();
   try {
     const payload = {
       ...basePayload(),
-      state: { password: "p", refresh_token: "r", session_id: "s", token: "t", input_tokens: 11, evidence: "ok" },
+      state: {
+        password: "p",
+        refresh_token: "r",
+        token: "t",
+        session_id: "s",
+        credential_type: "c",
+        password_attempts: 3,
+        input_tokens: 11,
+        evidence: "ok",
+      },
     };
     const res = await postTap(h, payload);
     assert.equal(res.status, 200);
     const [record] = await h.waitForRecords(1);
     assert.ok(record);
     const state = rec(rec(record.request).state);
-    for (const key of ["password", "refresh_token", "session_id", "token"]) {
-      assert.ok(!Object.prototype.hasOwnProperty.call(state, key), `${key} must be dropped`);
+    for (const key of ["password", "refresh_token", "token"]) {
+      assert.equal(state[key], "[REDACTED]", `${key} must be withheld in place, not silently dropped`);
     }
+    assert.equal(state.session_id, "s", "session_id is a legitimate field, not a credential");
+    assert.equal(state.credential_type, "c");
+    assert.equal(state.password_attempts, 3);
     assert.equal(state.input_tokens, 11, "token *counts* must not be treated as credentials");
     assert.equal(rec(rec(record.jev).usage).input_tokens, 11);
+
+    const redactedFields = record.redacted_fields as string[];
+    for (const path of ["request.state.password", "request.state.refresh_token", "request.state.token"]) {
+      assert.ok(redactedFields.includes(path), `${path} must be listed in redacted_fields`);
+    }
+    assert.ok(!redactedFields.some((path) => path.includes("session_id")), "legitimate fields must not be listed as redacted");
 
     assert.ok(!redactSecret(`{"password": "hunter2"}`, null).includes("hunter2"));
     assert.ok(!redactSecret("token=abc12345", null).includes("abc12345"));

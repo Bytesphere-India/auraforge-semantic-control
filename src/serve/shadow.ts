@@ -191,6 +191,8 @@ export interface JevLayaPairRecord {
   request_hash: string;
   payload_sha256: string;
   request: unknown;
+  /** field paths whose values were withheld from `request`/`jev` (visible audit marker) */
+  redacted_fields?: string[];
   forwarded: { url: string; content_type: string };
   jev: JevLayaPairJev;
   laya: JevLayaPairLaya;

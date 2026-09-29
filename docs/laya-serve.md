@@ -163,12 +163,13 @@ Jev to Laya without changing anything but the URL:
    the configured Jev upstream and returns the upstream status, response headers
    and body unchanged and immediately. Caller headers (trace ids, idempotency
    keys, ...) are forwarded too, minus hop-by-hop and transport-controlled ones
-   (`host`, `content-length`, `accept-encoding`, ...); the only header the tap
-   adds is the host-side `Authorization`, and a caller-supplied `Authorization`
-   is never forwarded. Callers send no key. The caller id comes from the
-   `X-Caller` request header. Redirects are **not followed**
-   (`redirect: "manual"`), so a 3xx `Location` cannot point the tap at loopback
-   or cloud metadata.
+   (`host`, `content-length`, `accept-encoding`, ...). It keeps the caller's
+   `Content-Type` and `Accept` (defaulting `Accept` to `application/json` only
+   when the caller sent none); the one header it injects is the host-side
+   `Authorization`, and a caller-supplied `Authorization` is never forwarded.
+   Callers send no key. The caller id comes from the `X-Caller` request header.
+   Redirects are **not followed** (`redirect: "manual"`), so a 3xx `Location`
+   cannot point the tap at loopback or cloud metadata.
 2. **Shadow after the reply.** Dispatch is a handoff: the server commits it only
    from the response `finish`/`close` event, so the shadow is scheduled strictly
    after the response is on the wire (and `drain()` can see the in-flight handoff
@@ -182,9 +183,12 @@ Jev to Laya without changing anything but the URL:
 3. **One joined record per call** (`jev-laya-pairs.jsonl`): the full request
    payload, Jev's full reply (status, answer, probabilities, usage/cost,
    latency), Laya's full reply (answers, probabilities, latency, model sha),
-   caller, request hash and timestamps. If Laya fails, the record is still
-   written with `laya.error` (`INVALID_JSON`, `ENGINE_ERROR`, `QUEUE_FULL`, ...).
-   `laya-decisions.jsonl` keeps receiving the per-question lines as before.
+   caller, request hash and timestamps. When a credential-named field's value is
+   withheld, the record carries a `redacted_fields` list of the affected paths so
+   a truncated payload is never silently presented as full. If Laya fails, the
+   record is still written with `laya.error` (`INVALID_JSON`, `ENGINE_ERROR`,
+   `QUEUE_FULL`, ...). `laya-decisions.jsonl` keeps receiving the per-question
+   lines as before.
 4. **Key handling.** `OPENROUTER_JEV_API_KEY` is read from the service
    environment or `~/.config/auraforge/secrets.env` inside the process and is
    only ever placed in the outbound `Authorization` header. It is never logged,
@@ -192,18 +196,21 @@ Jev to Laya without changing anything but the URL:
    enabled and no key it refuses to start, and a tap constructed without a key
    returns `503 JEV_KEY_MISSING` rather than forwarding unauthenticated calls.
    `/health` exposes only a non-reversible fingerprint.
-5. **Credential scrubbing.** Credential-named fields (`authorization`,
-   `api_key`, ...) are _dropped_ (not replaced) and string values are scrubbed of
-   `Bearer`/`Basic` tokens (any scheme-prefixed token of 8+ characters, including
-   all-alphabetic ones) and `authorization:`/`api_key=` assignments, including in
-   a non-JSON body and when the key is quoted (`{"api_key": "..."}`), consuming a
-   whole quoted value so embedded commas/braces/escapes cannot leave a suffix; the
-   `X-Caller` value is scrubbed the same way, and an object _key_ that is a
-   credential (a sensitive name, the host key itself, or an auth-header string)
-   is dropped rather than persisted. Credential names include `authorization`,
-   `api_key`, `secret`, `password`, `passphrase`, `credential`, `cookie`,
-   `session`, and `token`/`refresh_token`/`id_token`; token _counts_
-   (`input_tokens`, `output_tokens`, ...) are not affected. Only the media
+5. **Credential scrubbing with a visible marker.** A credential-named field is
+   _kept_ but its value is replaced with `[REDACTED]`, and the field path is
+   listed in the record's `redacted_fields`, so the "full request payload" is
+   never silently truncated. String values are scrubbed of `Bearer`/`Basic`
+   tokens (any scheme-prefixed token of 8+ characters, including all-alphabetic
+   ones) and `authorization:`/`api_key=` assignments, including in a non-JSON
+   body and when the key is quoted (`{"api_key": "..."}`), consuming a whole
+   quoted value so embedded commas/braces/escapes cannot leave a suffix; the
+   `X-Caller` value is scrubbed the same way. A key that itself contains the host
+   secret is dropped (recorded without echoing the key). Matching is bounded to
+   credential names — `authorization`, `api_key`, `password`/`passwd`/
+   `passphrase`, `secret`, `credential`, `session`, `cookie`, and `token`/
+   `refresh_token`/`id_token` — so legitimate domain fields such as `session_id`,
+   `credential_type`, `password_attempts` and token _counts_ (`input_tokens`,
+   `output_tokens`, ...) are preserved. Only the media
    type of a `Content-Type` is persisted (`application/json`, never its
    parameters). Prototype-polluting keys (`__proto__`, `constructor`,
    `prototype`) are ignored and storage uses null-prototype objects.
@@ -241,7 +248,9 @@ normalized (trailing root dots and case are stripped) before matching, so
 `localhost.`/`metadata.google.internal.` cannot bypass the gates. IPv4-mapped and
 IPv4-compatible IPv6 literals (`::ffff:169.254.169.254`, `::ffff:127.0.0.1`,
 `::7f00:1`, and their normalized hex forms) are decoded and classified as the
-IPv4 address they represent, so they cannot bypass these checks.
+IPv4 address they represent, so they cannot bypass these checks. The checks are
+string/address-class based: the hostname is resolved by the transport at connect
+time, so a DNS answer that changes after startup (rebinding) is not re-checked.
 
 ## Run
 

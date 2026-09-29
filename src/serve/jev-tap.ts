@@ -27,7 +27,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { redactSecret, sanitizeForStorage, secretFingerprint } from "./jev-key.js";
-import { parseJevUpstream, forwardableRequestHeaders, type HeaderMap, type JevForwardResult, type JevTransport } from "./jev-forward.js";
+import { parseJevUpstream, forwardableRequestHeaders, mediaType, type HeaderMap, type JevForwardResult, type JevTransport } from "./jev-forward.js";
 import { computeRequestHash, validateDecisionRequest, type ServeLimits, type ValidationResult } from "./protocol.js";
 import { SerialQueue } from "./serial-queue.js";
 import { recordShadowAnswers, type JevLayaPairLaya, type JevLayaPairsLog, type ShadowLog } from "./shadow.js";
@@ -131,17 +131,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
-/**
- * Persist only the media type of a `content-type` value. MIME parameters are
- * caller-controlled and can smuggle credentials (e.g.
- * `application/json; api_key=...`), so they are dropped; anything that is not a
- * clean `type/subtype` falls back to `application/json`.
- */
-function mediaType(value: string): string {
-  const bare = (value.split(";")[0] ?? "").trim().toLowerCase();
-  return /^[-a-z0-9!#$&^_.+]+\/[-a-z0-9!#$&^_.+]+$/.test(bare) ? bare : "application/json";
-}
-
 /** Synthesized upstream view when the tap refuses to forward (no host key). */
 function keyMissingForward(): JevForwardResult {
   return {
@@ -199,6 +188,7 @@ export function createJevTap(options: JevTapOptions): JevTap {
   const writePair = (args: ShadowArgs, prep: ShadowPrep, laya: JevLayaPairLaya): void => {
     const replyParsed = parseJson(args.forward.body);
     const replyRecord = asRecord(replyParsed);
+    const redacted: string[] = [];
     const usage = replyRecord && "usage" in replyRecord ? sanitizeForStorage(replyRecord.usage, options.apiKey) : null;
     options.pairs.record({
       schema: 1,
@@ -209,7 +199,8 @@ export function createJevTap(options: JevTapOptions): JevTap {
       caller: args.caller === null ? null : redactSecret(args.caller, options.apiKey),
       request_hash: prep.requestHash,
       payload_sha256: prep.payloadSha,
-      request: prep.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(prep.parsed, options.apiKey),
+      request: prep.parsed === undefined ? redactSecret(args.body, options.apiKey) : sanitizeForStorage(prep.parsed, options.apiKey, redacted, "request"),
+      redacted_fields: redacted.length > 0 ? redacted : undefined,
       forwarded: { url: upstreamUrl, content_type: mediaType(args.contentType) },
       jev: {
         status: args.forward.status,

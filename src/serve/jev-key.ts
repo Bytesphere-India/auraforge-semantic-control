@@ -46,9 +46,12 @@ export function secretFingerprint(secret: string): string {
   return createHash("sha256").update(secret).digest("hex").slice(0, 12);
 }
 
-const SENSITIVE_KEY = /(authorization|api[_-]?key|password|passwd|passphrase|credential|cookie|se(?:cret|ssion))/i;
+// Bounded name matching avoids false positives on legitimate domain fields
+// (`session_id`, `credential_type`, `password_attempts` are not credentials).
+const SENSITIVE_KEY = /(authorization|api[_-]?key)/i;
+const SENSITIVE_WORD = /(?:^|[_-])(?:password|passwd|passphrase|secret|credential|session|cookie)(?![a-z0-9_])/i;
 const SENSITIVE_TOKEN = /(?:^|[_-])token(?![a-z0-9_])/i;
-const isSensitiveKey = (key: string): boolean => SENSITIVE_KEY.test(key) || SENSITIVE_TOKEN.test(key);
+const isSensitiveKey = (key: string): boolean => SENSITIVE_KEY.test(key) || SENSITIVE_WORD.test(key) || SENSITIVE_TOKEN.test(key);
 
 /** Redact a `key[:=]value` assignment when the key names a credential. */
 const redactAssignment = (match: string, quote: string, key: string): string => (isSensitiveKey(key) ? `${quote}${key}${quote}=[REDACTED]` : match);
@@ -80,22 +83,39 @@ export function redactSecret(text: string, secret: string | null): string {
 const UNSAFE_KEY = /^(?:__proto__|prototype|constructor)$/;
 
 /**
- * Deep-copy a JSON value for persistence. Credential-named fields are removed
- * entirely (not replaced), prototype-polluting keys are ignored, and string
- * values are scrubbed. Uses a null-prototype object so a `__proto__` key can
- * never mutate the prototype of the stored object.
+ * Deep-copy a JSON value for persistence. A credential-named field is kept but
+ * its value is replaced with `[REDACTED]`, and the field path is appended to
+ * `redacted` so the record carries a visible marker instead of silently losing
+ * part of the "full request payload". Prototype-polluting keys, and keys that
+ * themselves contain the host secret, are dropped (the latter recorded without
+ * echoing the key); string values are scrubbed. Uses a null-prototype object so
+ * a `__proto__` key can never mutate the prototype of the stored object.
  */
-export function sanitizeForStorage(value: unknown, secret: string | null, depth = 0): unknown {
+export function sanitizeForStorage(value: unknown, secret: string | null, redacted: string[] = [], path = ""): unknown {
+  return sanitizeValue(value, secret, redacted, path, 0);
+}
+
+function sanitizeValue(value: unknown, secret: string | null, redacted: string[], path: string, depth: number): unknown {
   if (depth > 32) return "[depth-limit]";
   if (typeof value === "string") return redactSecret(value, secret);
-  if (Array.isArray(value)) return value.map((item) => sanitizeForStorage(item, secret, depth + 1));
+  if (Array.isArray(value)) return value.map((item, index) => sanitizeValue(item, secret, redacted, `${path}[${index}]`, depth + 1));
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (UNSAFE_KEY.test(key) || isSensitiveKey(key)) continue;
-      // a credential can also be smuggled as the key name itself
-      if (secret !== null && secret.length > 0 && key.includes(secret)) continue;
-      out[redactSecret(key, secret)] = sanitizeForStorage(item, secret, depth + 1);
+      const childPath = path === "" ? key : `${path}.${key}`;
+      if (UNSAFE_KEY.test(key)) continue;
+      // a credential can also be smuggled as the key name itself; never echo it
+      if (secret !== null && secret.length > 0 && key.includes(secret)) {
+        redacted.push("[key withheld: contained the host secret]");
+        continue;
+      }
+      const safeKey = redactSecret(key, secret);
+      if (isSensitiveKey(key)) {
+        out[safeKey] = "[REDACTED]";
+        redacted.push(redactSecret(childPath, secret));
+        continue;
+      }
+      out[safeKey] = sanitizeValue(item, secret, redacted, childPath, depth + 1);
     }
     return out;
   }
