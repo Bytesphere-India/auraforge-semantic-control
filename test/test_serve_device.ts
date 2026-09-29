@@ -15,11 +15,11 @@ import {
   buildSessionOptions,
   gpuCeilingViolation,
   gpuOnlyProviders,
+  gpuWeightsBudgetBytes,
   isFp32ModelDir,
   isGpuAttempt,
   loadDeviceConfig,
   loadEngine,
-  MAX_GPU_WEIGHTS_BYTES,
   probeCuda,
   probeProviders,
   providerName,
@@ -113,14 +113,26 @@ test("LAYA_SERVE_DEVICE=cpu wins over a GPU LAYA_SERVE_PROVIDERS list", () => {
   assert.equal(isGpuAttempt(buildExecutionProviders(handBuilt)), false);
 });
 
+test("gpuWeightsBudgetBytes derives the weight budget from the configured ceiling", () => {
+  assert.equal(gpuWeightsBudgetBytes(2048), 1024 * 1024 * 1024, "the default 2048 MiB ceiling admits 1 GiB of weights");
+  assert.equal(gpuWeightsBudgetBytes(1536), 512 * 1024 * 1024);
+  assert.equal(gpuWeightsBudgetBytes(1024), 0, "no weight budget once the context reserve consumes the ceiling");
+  assert.equal(gpuWeightsBudgetBytes(512), 0, "never negative");
+  // A value above the brief's hard ceiling never raises the budget.
+  assert.equal(gpuWeightsBudgetBytes(4096), 1024 * 1024 * 1024);
+  assert.equal(gpuWeightsBudgetBytes(8192), gpuWeightsBudgetBytes(2048));
+});
+
 test("gpuCeilingViolation fails closed on fp32, oversized and unverifiable bundles", () => {
   assert.equal(isFp32ModelDir("/opt/auraforge/models/laya/base-fp32"), true);
   assert.equal(isFp32ModelDir("/models/laya/base-fp16"), false);
-  assert.match(gpuCeilingViolation("/opt/auraforge/models/laya/base-fp32", null) ?? "", /fp32/);
-  assert.match(gpuCeilingViolation("/models/laya/base-fp16", MAX_GPU_WEIGHTS_BYTES + 1) ?? "", /over the .* GPU budget/);
-  assert.equal(gpuCeilingViolation("/models/laya/base-fp16", 800_000_000), null);
+  assert.match(gpuCeilingViolation("/opt/auraforge/models/laya/base-fp32", null, 2048) ?? "", /fp32/);
+  assert.match(gpuCeilingViolation("/models/laya/base-fp16", gpuWeightsBudgetBytes(2048) + 1, 2048) ?? "", /over the .* GPU budget/);
+  assert.equal(gpuCeilingViolation("/models/laya/base-fp16", 800_000_000, 2048), null);
   // Unknown size must not be assumed small.
-  assert.match(gpuCeilingViolation("/models/laya/base-fp16", null) ?? "", /could not be verified/);
+  assert.match(gpuCeilingViolation("/models/laya/base-fp16", null, 2048) ?? "", /could not be verified/);
+  // Lowering the configured ceiling tightens the enforced gate.
+  assert.match(gpuCeilingViolation("/models/laya/base-fp16", 800_000_000, 1536) ?? "", /budget for the 1536 MiB ceiling/);
 });
 
 test("weightsByteLength measures embedded and external weights, or reports null", async () => {
@@ -178,13 +190,35 @@ test("loadEngine refuses an oversized bundle even when its name looks quantized"
       probes += 1;
       return { available: true, reason: null };
     },
-    weightsBytes: () => MAX_GPU_WEIGHTS_BYTES + 1,
+    weightsBytes: () => gpuWeightsBudgetBytes(2048) + 1,
     log: () => undefined,
   });
   assert.equal(outcome.device, "cpu");
   assert.deepEqual(calls, [["cpu"]]);
   assert.equal(probes, 0);
   assert.match(outcome.ceiling?.reason ?? "", /GPU budget/);
+});
+
+test("loadEngine tracks LAYA_SERVE_GPU_MEM_MB: a lower ceiling refuses a bundle the default allows", async () => {
+  const calls: string[][] = [];
+  let probes = 0;
+  const outcome = await loadEngine({
+    modelDir: "/models/laya/base-fp16",
+    // 800 MB weights fit the default 2048 MiB budget (1 GiB) but not a 1536 MiB
+    // ceiling (512 MiB budget).
+    cfg: loadDeviceConfig({ LAYA_SERVE_DEVICE: "cuda", LAYA_SERVE_GPU_MEM_MB: "1536" }),
+    load: collectLoader(calls),
+    probe: async () => {
+      probes += 1;
+      return { available: true, reason: null };
+    },
+    weightsBytes: () => 800_000_000,
+    log: () => undefined,
+  });
+  assert.equal(outcome.device, "cpu");
+  assert.deepEqual(calls, [["cpu"]]);
+  assert.equal(probes, 0);
+  assert.match(outcome.ceiling?.reason ?? "", /1536 MiB ceiling/);
 });
 
 test("loadEngine allows a small quantized bundle on the verified GPU path", async () => {

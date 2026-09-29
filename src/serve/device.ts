@@ -11,9 +11,12 @@
  *   - `LAYA_SERVE_GPU_MEM_MB` (default 2048) is the ceiling we advertise to the
  *     CUDA EP. onnxruntime-node 1.22 only forwards `deviceId` for the CUDA EP,
  *     so `gpu_mem_limit` / `arena_extend_strategy` are recorded but not honoured
- *     by the binding; the hard ceiling is enforced by refusing fp32/oversized
- *     bundles on the GPU (see `gpuCeilingViolation`) and by measuring the total
- *     GPU delta (see scripts/bench-latency.ts).
+ *     by the binding; the enforced gate instead derives a weight budget from this
+ *     ceiling (`gpuWeightsBudgetBytes`, ceiling minus a context reserve), refuses
+ *     fp32/oversized/unverifiable bundles on the GPU (see `gpuCeilingViolation`),
+ *     and is verified by measuring the total GPU delta (see
+ *     scripts/bench-latency.ts). Lowering the value therefore tightens the gate;
+ *     a value above the hard 2048 MiB ceiling never raises it.
  *   - `LAYA_SERVE_GPU_DEVICE_ID` (default 0)
  *   - CPU knobs: `LAYA_SERVE_INTRA_OP_THREADS`, `LAYA_SERVE_INTER_OP_THREADS`
  *
@@ -57,11 +60,31 @@ const GPU_PROVIDERS = new Set(["cuda", "tensorrt"]);
 const MAX_GPU_MEM_MB = 1_000_000;
 
 /**
- * Weight sizes above this cannot meet the 2048 MiB VRAM ceiling once the CUDA
- * context/arenas are added (fp32 weights are ~1.68 GB; quantized ≤ ~0.9 GB), so
- * such a bundle is forced onto CPU even if its directory name looks quantized.
+ * CUDA context/arena reserve subtracted from the configured ceiling before any
+ * weights are admitted. fp32 measured ≈2337 MiB total for ≈1607 MiB of weights
+ * (≈730 MiB of context overhead); we reserve a full 1024 MiB so the default
+ * 2048 MiB ceiling admits the same 1 GiB weight budget as before and lowering
+ * `LAYA_SERVE_GPU_MEM_MB` tightens the enforced gate.
  */
-export const MAX_GPU_WEIGHTS_BYTES = 1024 * 1024 * 1024;
+export const GPU_CONTEXT_OVERHEAD_MB = 1024;
+
+/**
+ * The hard total-VRAM ceiling from the brief. `LAYA_SERVE_GPU_MEM_MB` may
+ * tighten it, but a value above it never raises the enforced budget.
+ */
+export const HARD_GPU_MEM_MB = 2048;
+
+/**
+ * Weight budget (bytes) implied by the configured VRAM ceiling. The hard 2048 MiB
+ * ceiling therefore admits 1 GiB of weights; a lower `LAYA_SERVE_GPU_MEM_MB`
+ * admits proportionally less (and 0 at or below the context reserve). Values
+ * above `HARD_GPU_MEM_MB` are clamped so the brief's hard ceiling cannot be
+ * raised from the environment.
+ */
+export function gpuWeightsBudgetBytes(gpuMemMb: number): number {
+  const effective = Math.min(gpuMemMb, HARD_GPU_MEM_MB);
+  return Math.max(0, effective - GPU_CONTEXT_OVERHEAD_MB) * 1024 * 1024;
+}
 
 function integer(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
   const raw = env[name];
@@ -190,19 +213,22 @@ export function weightsByteLength(modelDir: string): number | null {
 }
 
 /**
- * The reason a bundle may not run on the GPU under the 2048 MiB ceiling, or null
- * when it may.
+ * The reason a bundle may not run on the GPU under the configured VRAM ceiling,
+ * or null when it may. `gpuMemMb` is the same value the CUDA EP is configured
+ * with (`LAYA_SERVE_GPU_MEM_MB`), so the enforced weight budget tracks the
+ * operator's ceiling instead of a hardcoded constant.
  *
- * Fails closed: fp32 is always refused (≈2337 MiB measured before inference), an
- * oversized weight total is refused regardless of its directory name, and a
- * bundle whose weight size cannot be verified at all is refused too (an
- * unverifiable model must never be assumed small).
+ * Fails closed: fp32 is always refused (≈2337 MiB measured before inference), a
+ * weight total over the ceiling-derived budget is refused regardless of its
+ * directory name, and a bundle whose weight size cannot be verified at all is
+ * refused too (an unverifiable model must never be assumed small).
  */
-export function gpuCeilingViolation(modelDir: string, weightsBytes: number | null): string | null {
+export function gpuCeilingViolation(modelDir: string, weightsBytes: number | null, gpuMemMb: number): string | null {
   if (isFp32ModelDir(modelDir)) return `model directory ${path.basename(path.resolve(modelDir))} is the unquantized fp32 bundle`;
   if (weightsBytes === null) return `weight size could not be verified under ${path.resolve(modelDir)}`;
-  if (weightsBytes > MAX_GPU_WEIGHTS_BYTES) {
-    return `weights are ${weightsBytes} bytes, over the ${MAX_GPU_WEIGHTS_BYTES}-byte GPU budget`;
+  const budget = gpuWeightsBudgetBytes(gpuMemMb);
+  if (weightsBytes > budget) {
+    return `weights are ${weightsBytes} bytes, over the ${budget}-byte GPU budget for the ${gpuMemMb} MiB ceiling`;
   }
   return null;
 }
@@ -250,7 +276,7 @@ export interface LoadEngineDeps {
 
 const firstLine = (text: string): string => text.split("\n", 1)[0] ?? text;
 
-/** Force a GPU request to CPU when the bundle cannot meet the 2048 MiB ceiling. */
+/** Force a GPU request to CPU when the bundle cannot meet the configured ceiling. */
 function applyCeiling(
   cfg: DeviceConfig,
   modelDir: string,
@@ -258,9 +284,9 @@ function applyCeiling(
   log: (message: string) => void,
 ): { cfg: DeviceConfig; ceiling: EngineCeiling | null } {
   if (!isGpuAttempt(buildExecutionProviders(cfg))) return { cfg, ceiling: null };
-  const reason = gpuCeilingViolation(modelDir, weightsBytes);
+  const reason = gpuCeilingViolation(modelDir, weightsBytes, cfg.gpuMemMb);
   if (reason === null) return { cfg, ceiling: null };
-  log(`laya-serve: 2048 MiB VRAM ceiling: ${reason}; staying on the CPU execution provider`);
+  log(`laya-serve: ${cfg.gpuMemMb} MiB VRAM ceiling: ${reason}; staying on the CPU execution provider`);
   return { cfg: { ...cfg, requested: "cpu", providers: null }, ceiling: { from: "cuda", reason } };
 }
 

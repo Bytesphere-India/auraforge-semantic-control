@@ -53,12 +53,16 @@ llama-server, subject to two non-negotiables:
    ceiling is enforced in code and verified by measuring the total GPU delta.
    fp32 on CUDA adds ≈ 2337 MiB before any inference, so a bundle is refused on
    the GPU before any session/probe when its directory name says `fp32`, when
-   `laya.onnx` + `laya.onnx.data` (embedded or external weights) total over 1 GiB,
-   **or when neither file can be measured at all** (`gpuCeilingViolation` fails
-   closed — an unverifiable bundle is never assumed small); the request is
-   downgraded to CPU and logged. Only a small quantized variant
-   (nvfp4 / fp8 / fp16, ≈ 0.8 GiB) may be promoted to CUDA, and only after its
-   measured total delta is ≤ 2048 MiB.
+   `laya.onnx` + `laya.onnx.data` (embedded or external weights) exceed the
+   budget **derived from `LAYA_SERVE_GPU_MEM_MB`** (`gpuWeightsBudgetBytes` =
+   ceiling − 1024 MiB context reserve, i.e. 1 GiB at the default 2048 MiB
+   ceiling), **or when neither file can be measured at all** (`gpuCeilingViolation`
+   fails closed — an unverifiable bundle is never assumed small); the request is
+   downgraded to CPU and logged. Lowering `LAYA_SERVE_GPU_MEM_MB` therefore
+   tightens the enforced gate (e.g. 1536 MiB admits only 512 MiB of weights),
+   while a value above the hard 2048 MiB ceiling never raises the budget.
+   Only a small quantized variant (nvfp4 / fp8 / fp16, ≈ 0.8 GiB) may be promoted
+   to CUDA, and only after its measured total delta is ≤ 2048 MiB.
 2. **Never crowd out NInfer.** The provider list is `["cuda", "cpu"]`, so
    unsupported nodes fall back per-node rather than failing the session. Before
    the real session opens, the exact provider stack is exercised on a 95-byte
@@ -283,7 +287,7 @@ The tap is inactive when `LAYA_SERVE_JEV_ENABLED=0` (the route then reports
 | `LAYA_SERVE_MODEL_ID`           | derived (`laya-base-fp32`)                      | identity string                                                                   |
 | `LAYA_SERVE_DEVICE`             | `cuda`                                          | `cuda` (CPU fallback) or `cpu`                                                    |
 | `LAYA_SERVE_PROVIDERS`          | unset                                           | explicit EP list, e.g. `tensorrt,cuda,cpu`; rejected with `LAYA_SERVE_DEVICE=cpu` |
-| `LAYA_SERVE_GPU_MEM_MB`         | `2048`                                          | hard VRAM ceiling for the CUDA EP (MiB)                                           |
+| `LAYA_SERVE_GPU_MEM_MB`         | `2048`                                          | VRAM ceiling (MiB); enforced weight budget = min(value, 2048) − 1024 MiB reserve  |
 | `LAYA_SERVE_GPU_DEVICE_ID`      | `0`                                             | CUDA device ordinal                                                               |
 | `LAYA_SERVE_INTRA_OP_THREADS`   | unset (ORT default)                             | CPU intra-op threads                                                              |
 | `LAYA_SERVE_INTER_OP_THREADS`   | unset (ORT default)                             | CPU inter-op threads                                                              |
