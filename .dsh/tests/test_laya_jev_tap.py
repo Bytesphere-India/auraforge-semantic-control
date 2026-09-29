@@ -1,14 +1,15 @@
-"""Lane test bridge for the Jev shadow tap (Raja 2026-09-29).
+"""Lane conformance entrypoint for the Jev shadow tap (Raja 2026-09-29).
 
-`lane.sh` records test evidence by running changed Python test modules with
-`pytest`.  This lane's service tests are TypeScript (`tsx --test`), so without a
-bridge the coordinator's evidence file only ever says
-``no targeted python tests (warn)``.  This module runs the real, impact-scoped
-TypeScript serve/tap suite and asserts a positive pass count with zero failures,
-so the lane's evidence records the actual result of the tests that matter.
+The authoritative service tests are TypeScript (`tsx --test`, wired into
+`package.json` `"test"` per the brief).  This project has no Python tests, and the
+lane's evidence runner is `pytest` over changed `test_*.py` modules, so this
+single module is the lane's Python entrypoint: it runs the real TypeScript
+serve/tap suite exactly as `package.json` does and asserts a positive pass count
+with zero failures.  It does not reimplement or replace those tests.
 
-It never modifies the repo, uses only a local fake upstream (no network), and is
-safe to run repeatedly.
+Fail-closed on every infrastructure problem: a missing `tsx`, a timeout, a
+non-zero exit, or a summary with no tests / no passes / any failure all fail the
+test rather than reporting a false positive.
 """
 
 from __future__ import annotations
@@ -21,30 +22,36 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TSX = REPO_ROOT / "node_modules" / ".bin" / "tsx"
 
-# Every TypeScript module this lane's `laya-serve` surface is verified by.  The
-# tap suite is the brief's subject; the others cover the shared server/shadow
-# code paths it builds on.
+# The impact-scoped TypeScript modules this lane's `laya-serve` surface is
+# verified by; `test_serve_jev_tap.ts` is the brief's subject.
 SERVE_TEST_MODULES = (
     "test/test_serve_protocol.ts",
     "test/test_serve_shadow.ts",
     "test/test_serve_http.ts",
     "test/test_serve_jev_tap.ts",
 )
+TIMEOUT_SECONDS = 900
 
-_PASS = re.compile(r"^# pass (\d+)$", re.MULTILINE)
-_FAIL = re.compile(r"^# fail (\d+)$", re.MULTILINE)
-_TESTS = re.compile(r"^# tests (\d+)$", re.MULTILINE)
+_INT = r"(\d+)"
+_TESTS = re.compile(rf"^# tests {_INT}$", re.MULTILINE)
+_PASS = re.compile(rf"^# pass {_INT}$", re.MULTILINE)
+_FAIL = re.compile(rf"^# fail {_INT}$", re.MULTILINE)
 
 
 def test_serve_tap_suite_passes() -> None:
-    """The TypeScript serve/tap suite must pass with a positive test count."""
-    result = subprocess.run(
-        [str(TSX), "--test", *SERVE_TEST_MODULES],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    """The authoritative TypeScript serve/tap suite must pass."""
+    assert TSX.is_file(), f"missing TypeScript test runner: {TSX}"
+    try:
+        result = subprocess.run(
+            [str(TSX), "--test", *SERVE_TEST_MODULES],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError(f"tsx --test timed out after {TIMEOUT_SECONDS}s") from error
+
     output = result.stdout + result.stderr
     assert result.returncode == 0, f"tsx --test exited {result.returncode}:\n{output}"
 
