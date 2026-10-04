@@ -1,0 +1,4 @@
+repo: auraforge-semantic-control
+head: coord/control
+state: STATE.md
+latest_transition: transitions/2026-10-04-bootstrap.md
