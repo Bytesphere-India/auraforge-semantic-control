@@ -1,4 +1,7 @@
 # HYDRATE (coordinator control head) - PRIMARY hydration source for auraforge-semantic-control
+
+**ROADMAP RULE (Raja 2026-10-13, Medhika 36edfc45, binding): planned work exists only as Milestone > Requirement > LOOP > GEN in `.medhika/ROADMAP.json` (af-roadmap/v1) on auraforge-loop-platform medhika/control (portfolio root). The tracker (Bytesphere-India/auraforge-tracker) is loaded from it by tracker-sync.py on the tick; never hand-edit board structure: ask Medhika (ADD GEN to LOOP-X / UPDATE LOOP-X/Gn / ADD LOOP / ADD REQ, each with DoD+UAT). Every round targets an open GEN in ROADMAP.json (gen-gate.py); a closed GEN is never redone. Execution state (status, RUNs, jobs) stays here and on the issues, never in ROADMAP.json.**
+
 Planes:
 - coord/control (this branch, ~/projects/auraforge-semantic-control-coord-control): EXECUTION. Lanes, jobs, SIDs, briefs, transitions, pointers, runbooks, RUNS, NOW, AUTOPILOT. Owner Raja + Claude. All execution state is written HERE.
 - medhika/control (~/projects/auraforge-semantic-control-medhika-control): ARCHITECTURE REFERENCE ONLY. Decisions, DoD/UAT plans, reviews, contracts. Never write execution state there.
